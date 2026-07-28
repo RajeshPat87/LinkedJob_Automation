@@ -33,7 +33,7 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support.select import Select
 from selenium.webdriver.remote.webelement import WebElement
-from selenium.common.exceptions import NoSuchElementException, ElementClickInterceptedException, NoSuchWindowException, ElementNotInteractableException, WebDriverException
+from selenium.common.exceptions import NoSuchElementException, ElementClickInterceptedException, NoSuchWindowException, ElementNotInteractableException, WebDriverException, InvalidSessionIdException
 
 from config.personals import *
 from config.questions import *
@@ -279,6 +279,20 @@ def get_page_info() -> tuple[WebElement | None, int | None]:
 
 
 
+def dismiss_modal_overlay(attempts: int = 3) -> bool:
+    '''
+    Function to close any leftover LinkedIn modal whose overlay covers the job list and
+    swallows clicks meant for the next job card. Returns `True` if no overlay is left.
+    '''
+    for _ in range(attempts):
+        if not driver.find_elements(By.CLASS_NAME, "artdeco-modal-overlay"): return True
+        try_xp(driver, "//button[contains(@aria-label, 'Dismiss')]")
+        actions.send_keys(Keys.ESCAPE).perform()
+        wait_span_click(driver, 'Discard', 1, scroll=False)
+        time.sleep(0.5)
+    return not driver.find_elements(By.CLASS_NAME, "artdeco-modal-overlay")
+
+
 def get_job_main_details(job: WebElement, blacklisted_companies: set, rejected_jobs: set) -> tuple[str, str, str, str, str, bool]:
     '''
     # Function to get job main details.
@@ -300,10 +314,21 @@ def get_job_main_details(job: WebElement, blacklisted_companies: set, rejected_j
     # work_location = job.find_element(By.CLASS_NAME, "job-card-container__metadata-item").text
     other_details = job.find_element(By.CLASS_NAME, 'artdeco-entity-lockup__subtitle').text
     index = other_details.find(' · ')
-    company = other_details[:index]
-    work_location = other_details[index+3:]
-    work_style = work_location[work_location.rfind('(')+1:work_location.rfind(')')]
-    work_location = work_location[:work_location.rfind('(')].strip()
+    if index == -1:
+        # LinkedIn now often puts only the company in the subtitle and the location in its own
+        # element. Slicing on index = -1 silently chopped characters off all three fields
+        # (e.g. "Ingram Micro" -> "Ingram Micr"), so read them separately instead.
+        company = other_details.strip()
+        work_location = "Unknown"
+        try: work_location = job.find_element(By.CLASS_NAME, "job-card-container__metadata-item").text.strip()
+        except NoSuchElementException: pass
+    else:
+        company = other_details[:index].strip()
+        work_location = other_details[index+3:].strip()
+    work_style = "Unknown"
+    if '(' in work_location and ')' in work_location:
+        work_style = work_location[work_location.rfind('(')+1:work_location.rfind(')')].strip()
+        work_location = work_location[:work_location.rfind('(')].strip()
     
     # Skip if previously rejected due to blacklist or already applied
     if company in blacklisted_companies:
@@ -317,13 +342,28 @@ def get_job_main_details(job: WebElement, blacklisted_companies: set, rejected_j
             skip = True
             print_lg(f'Already applied to "{title} | {company}" job. Job ID: {job_id}!')
     except: pass
-    try: 
-        if not skip: job_details_button.click()
-    except Exception as e:
-        print_lg(f'Failed to click "{title} | {company}" job on details button. Job ID: {job_id}!') 
-        # print_lg(e)
-        discard_job()
-        job_details_button.click() # To pass the error outside
+    if not skip:
+        try:
+            job_details_button.click()
+        except ElementClickInterceptedException:
+            # A leftover modal's overlay is painted over the job list, clear it and retry
+            print_lg(f'Job list is covered by a modal, dismissing it to open "{title} | {company}". Job ID: {job_id}')
+            dismiss_modal_overlay()
+            try:
+                scroll_to_view(driver, job_details_button, True)
+                job_details_button.click()
+            except Exception:
+                try:
+                    # Last resort, JS click goes straight to the element ignoring what's on top of it
+                    driver.execute_script("arguments[0].click();", job_details_button)
+                except Exception as e:
+                    print_lg(f'Failed to open "{title} | {company}" job, skipping it. Job ID: {job_id}!', e)
+                    skip = True
+        except Exception as e:
+            print_lg(f'Failed to click "{title} | {company}" job on details button. Job ID: {job_id}!')
+            # print_lg(e)
+            discard_job()
+            job_details_button.click() # To pass the error outside
     buffer(click_gap)
     return (job_id,title,company,work_location,work_style,skip)
 
@@ -394,12 +434,15 @@ def get_job_description(
         skipReason = None
         skipMessage = None
         for word in bad_words:
-            if word.lower() in jobDescriptionLow:
+            # Whole word/phrase match, so "Intern" doesn't skip a job that merely says "internal"
+            if re.search(r'\b' + re.escape(word.lower()) + r'\b', jobDescriptionLow):
                 skipMessage = f'\n{jobDescription}\n\nContains bad word "{word}". Skipping this job!\n'
                 skipReason = "Found a Bad Word in About Job"
                 skip = True
                 break
-        if not skip and security_clearance == False and ('polygraph' in jobDescriptionLow or 'clearance' in jobDescriptionLow or 'secret' in jobDescriptionLow):
+        # Phrases instead of the bare words "clearance"/"secret", which match things like "External Secrets"
+        clearance_phrases = ('polygraph', 'security clearance', 'secret clearance', 'top secret', 'ts/sci', 'government clearance', 'active clearance')
+        if not skip and security_clearance == False and any(phrase in jobDescriptionLow for phrase in clearance_phrases):
             skipMessage = f'\n{jobDescription}\n\nFound "Clearance" or "Polygraph". Skipping this job!\n'
             skipReason = "Asking for Security clearance"
             skip = True
@@ -752,6 +795,35 @@ def answer_questions(modal: WebElement, questions_list: set, work_location: str,
 
 
 
+def capture_external_link(tabs_before: int, settle_seconds: int = 10) -> str | None:
+    '''
+    Function to grab the employer's application link from the tab LinkedIn just opened.
+    Returns `None` if no new tab was opened.
+    * `tabs_before` - number of browser tabs before the Apply button was clicked
+    * `settle_seconds` - how long to wait for the new tab to land on the employer's site
+    '''
+    global tabs_count
+    windows = driver.window_handles
+    if len(windows) <= tabs_before: return None
+    tabs_count = len(windows)
+    driver.switch_to.window(windows[-1])
+    # The new tab starts on about:blank and hops through a LinkedIn offsite redirect, often
+    # followed by an ad network (appcast, click trackers), before reaching the employer's ATS.
+    # So wait for the URL to stop changing rather than grabbing the first non-LinkedIn hop.
+    application_link = driver.current_url
+    settled_polls = 0
+    for _ in range(settle_seconds * 2):
+        time.sleep(0.5)
+        current_link = driver.current_url
+        landed = bool(current_link) and current_link != "about:blank" and "linkedin.com" not in current_link
+        settled_polls = settled_polls + 1 if landed and current_link == application_link else 0
+        application_link = current_link
+        if settled_polls >= 2: break
+    if close_tabs and driver.current_window_handle != linkedIn_tab: driver.close()
+    driver.switch_to.window(linkedIn_tab)
+    return application_link
+
+
 def external_apply(pagination_element: WebElement, job_id: str, job_link: str, resume: str, date_listed, application_link: str, screenshot_name: str) -> tuple[bool, str, int]:
     '''
     Function to open new tab and save external job application links
@@ -761,18 +833,17 @@ def external_apply(pagination_element: WebElement, job_id: str, job_link: str, r
         try:
             if "exceeded the daily application limit" in driver.find_element(By.CLASS_NAME, "artdeco-inline-feedback__message").text: dailyEasyApplyLimitReached = True
         except: pass
-        print_lg("Easy apply failed I guess!")
-        if pagination_element != None: return True, application_link, tabs_count
+        if not collect_external_links:
+            print_lg("Easy apply failed I guess!")
+            if pagination_element != None: return True, application_link, tabs_count
     try:
+        tabs_before = len(driver.window_handles)
         wait.until(EC.element_to_be_clickable((By.XPATH, ".//button[contains(@class,'jobs-apply-button') and contains(@class, 'artdeco-button--3')]"))).click() # './/button[contains(span, "Apply") and not(span[contains(@class, "disabled")])]'
         wait_span_click(driver, "Continue", 1, True, False)
-        windows = driver.window_handles
-        tabs_count = len(windows)
-        driver.switch_to.window(windows[-1])
-        application_link = driver.current_url
+        captured_link = capture_external_link(tabs_before)
+        if captured_link is None: raise Exception("Apply button didn't open an external application tab!")
+        application_link = captured_link
         print_lg('Got the external application link "{}"'.format(application_link))
-        if close_tabs and driver.current_window_handle != linkedIn_tab: driver.close()
-        driver.switch_to.window(linkedIn_tab)
         return False, application_link, tabs_count
     except Exception as e:
         # print_lg(e)
@@ -838,10 +909,11 @@ def submitted_jobs(job_id: str, title: str, company: str, work_location: str, wo
     '''
     try:
         with open(file_name, mode='a', newline='', encoding='utf-8') as csv_file:
-            fieldnames = ['Job ID', 'Title', 'Company', 'Work Location', 'Work Style', 'About Job', 'Experience required', 'Skills required', 'HR Name', 'HR Link', 'Resume', 'Re-posted', 'Date Posted', 'Date Applied', 'Job Link', 'External Job link', 'Questions Found', 'Connect Request']
+            fieldnames = ['Job ID', 'Title', 'Company', 'Work Location', 'Work Style', 'Status', 'About Job', 'Experience required', 'Skills required', 'HR Name', 'HR Link', 'Resume', 'Re-posted', 'Date Posted', 'Date Applied', 'Job Link', 'External Job link', 'Questions Found', 'Connect Request']
             writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
             if csv_file.tell() == 0: writer.writeheader()
-            writer.writerow({'Job ID':truncate_for_csv(job_id), 'Title':truncate_for_csv(title), 'Company':truncate_for_csv(company), 'Work Location':truncate_for_csv(work_location), 'Work Style':truncate_for_csv(work_style), 
+            status = "Easy Applied" if application_link == "Easy Applied" else "External link collected"
+            writer.writerow({'Job ID':truncate_for_csv(job_id), 'Title':truncate_for_csv(title), 'Company':truncate_for_csv(company), 'Work Location':truncate_for_csv(work_location), 'Work Style':truncate_for_csv(work_style), 'Status':status,
                             'About Job':truncate_for_csv(description), 'Experience required': truncate_for_csv(experience_required), 'Skills required':truncate_for_csv(skills), 
                                 'HR Name':truncate_for_csv(hr_name), 'HR Link':truncate_for_csv(hr_link), 'Resume':truncate_for_csv(resume), 'Re-posted':truncate_for_csv(reposted), 
                                 'Date Posted':truncate_for_csv(date_listed), 'Date Applied':truncate_for_csv(date_applied), 'Job Link':truncate_for_csv(job_link), 
@@ -897,8 +969,16 @@ def apply_to_jobs(search_terms: list[str]) -> None:
                     if current_count >= switch_number: break
                     print_lg("\n-@-\n")
 
-                    job_id,title,company,work_location,work_style,skip = get_job_main_details(job, blacklisted_companies, rejected_jobs)
-                    
+                    try:
+                        job_id,title,company,work_location,work_style,skip = get_job_main_details(job, blacklisted_companies, rejected_jobs)
+                    except (NoSuchWindowException, InvalidSessionIdException):
+                        raise   # Browser is genuinely gone, let the outer handler end the run
+                    except Exception as e:
+                        print_lg("Failed to read this job card, skipping it!", e)
+                        critical_error_log("In get_job_main_details", e)
+                        skip_count += 1
+                        continue
+
                     if skip: continue
                     # Redundant fail safe check for applied jobs!
                     try:
@@ -1001,6 +1081,7 @@ def apply_to_jobs(search_terms: list[str]) -> None:
                         ##<
 
                     uploaded = False
+                    external_link = None    # Set when a fallback below already opened the employer's application tab
                     # Case 1: Easy Apply Button
                     # First try the classic button with "Easy" in aria-label
                     is_easy_apply = try_xp(driver, ".//button[contains(@class,'jobs-apply-button') and contains(@class, 'artdeco-button--3') and contains(@aria-label, 'Easy')]")
@@ -1024,11 +1105,9 @@ def apply_to_jobs(search_terms: list[str]) -> None:
                                 buffer(click_gap)
                                 tabs_after = len(driver.window_handles)
                                 if tabs_after > tabs_before:
-                                    # New tab opened — external apply, close it and go back
-                                    driver.switch_to.window(driver.window_handles[-1])
-                                    if close_tabs and driver.current_window_handle != linkedIn_tab: driver.close()
-                                    driver.switch_to.window(linkedIn_tab)
-                                    print_lg("External apply detected via new tab, skipping")
+                                    # New tab opened — external apply, capture the employer's link before going back
+                                    external_link = capture_external_link(tabs_before)
+                                    print_lg('External apply detected via new tab, got the application link "{}"'.format(external_link))
                                 else:
                                     try:
                                         find_by_class(driver, "jobs-easy-apply-modal")
@@ -1106,8 +1185,15 @@ def apply_to_jobs(search_terms: list[str]) -> None:
                             failed_count += 1
                             discard_job()
                             continue
+                    elif external_link:
+                        # Case 2a: Apply button already opened the employer's site above, just record the link
+                        if not collect_external_links:
+                            print_lg("Skipping this external job, `collect_external_links` is turned off!")
+                            skip_count += 1
+                            continue
+                        application_link = external_link
                     else:
-                        # Case 2: Apply externally
+                        # Case 2b: Apply externally
                         skip, application_link, tabs_count = external_apply(pagination_element, job_id, job_link, resume, date_listed, application_link, screenshot_name)
                         if dailyEasyApplyLimitReached:
                             print_lg("\n###############  Daily application limit for Easy Apply is reached!  ###############\n")
@@ -1137,8 +1223,18 @@ def apply_to_jobs(search_terms: list[str]) -> None:
                     break
 
         except (NoSuchWindowException, WebDriverException) as e:
-            print_lg("Browser window closed or session is invalid. Ending application process.", e)
-            raise e # Re-raise to be caught by main
+            # ElementClickInterceptedException & friends are WebDriverException subclasses, so
+            # confirm the session is actually dead before writing off the whole run.
+            try:
+                driver.current_url
+                browser_alive = True
+            except Exception:
+                browser_alive = False
+            if not browser_alive:
+                print_lg("Browser window closed or session is invalid. Ending application process.", e)
+                raise e # Re-raise to be caught by main
+            print_lg("Recoverable browser error, moving on to the next search term!", e)
+            critical_error_log("In Applier", e)
         except Exception as e:
             print_lg("Failed to find Job listings!")
             critical_error_log("In Applier", e)

@@ -14,7 +14,7 @@ Support me: https://github.com/sponsors/GodsScion
 version:    26.01.20.5.08
 '''
 
-from personals import *
+from config.personals import *
 import json
 
 ###################################################### CONFIGURE YOUR RESUME HERE ######################################################

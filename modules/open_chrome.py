@@ -28,6 +28,24 @@ from selenium.webdriver.support.ui import WebDriverWait
 from modules.helpers import find_default_profile_directory, critical_error_log, print_lg
 from selenium.common.exceptions import SessionNotCreatedException
 
+##> ------ Local fix : Pin ChromeDriver to the installed Chrome version ------
+def get_installed_chrome_major_version() -> int | None:
+    '''
+    Returns the major version number of the locally installed Google Chrome, or `None` if it can't be determined.
+    `undetected_chromedriver` otherwise downloads the *latest* ChromeDriver, which fails to start a session
+    whenever the driver is ahead of the installed browser (Eg: driver 151 against Chrome 150).
+    '''
+    if not stealth_mode: return None
+    try:
+        import re, subprocess
+        output = subprocess.run([uc.find_chrome_executable(), "--version"], capture_output=True, text=True, timeout=30).stdout
+        match = re.search(r"(\d+)\.\d+\.\d+", output)
+        return int(match.group(1)) if match else None
+    except Exception as e:
+        print_lg("Couldn't detect installed Chrome version, will use latest ChromeDriver. Reason: {}".format(e))
+        return None
+##<
+
 def createChromeSession(isRetry: bool = False):
     make_directories([file_name,failed_file_name,logs_folder_path+"/screenshots",default_resume_path,generated_resume_path+"/temp"])
     # Set up WebDriver with Chrome Profile
@@ -50,7 +68,9 @@ def createChromeSession(isRetry: bool = False):
         # except (FileNotFoundError, PermissionError) as e: 
         #     print_lg("(Undetected Mode) Got '{}' when using pre-installed ChromeDriver.".format(type(e).__name__)) 
             print_lg("Downloading Chrome Driver... This may take some time. Undetected mode requires download every run!")
-            driver = uc.Chrome(options=options)
+##> ------ Local fix : Pin ChromeDriver to the installed Chrome version ------
+            driver = uc.Chrome(options=options, version_main=get_installed_chrome_major_version())
+##<
     else: driver = webdriver.Chrome(options=options) #, service=Service(executable_path="C:\\Program Files\\Google\\Chrome\\chromedriver-win64\\chromedriver.exe"))
     driver.maximize_window()
     wait = WebDriverWait(driver, 5)

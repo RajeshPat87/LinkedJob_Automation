@@ -191,6 +191,7 @@ def validate_settings() -> None | ValueError | TypeError:
     __validation_file_path = "config/settings.py"
 
     check_boolean(close_tabs, "close_tabs")
+    check_boolean(collect_external_links, "collect_external_links")
     check_boolean(follow_companies, "follow_companies")
     # check_boolean(connect_hr, "connect_hr")
     # check_string(connect_request_message, "connect_request_message", min_length=10)

@@ -25,6 +25,15 @@ close_tabs = False                  # True or False, Note: True or False are cas
 Note: RECOMMENDED TO LEAVE IT AS `True`, if you set it `False`, be sure to CLOSE ALL TABS BEFORE CLOSING THE BROWSER!!!
 '''
 
+# Collect external (non Easy Apply) application links?
+collect_external_links = True       # True or False, Note: True or False are case-sensitive
+'''
+Note: When `True`, jobs that redirect to the company's own careers site are still opened,
+their application link is captured and saved to the applied jobs excel under
+"External Job link", and they count towards "External job links collected".
+Set it to `False` to skip such jobs entirely when `easy_apply_only` is `True`.
+'''
+
 # Follow easy applied companies
 follow_companies = False            # True or False, Note: True or False are case-sensitive
 
