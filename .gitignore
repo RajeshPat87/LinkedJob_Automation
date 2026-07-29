@@ -12,3 +12,5 @@ secrets.py
 config/personals.py
 .venv
 apikeys.py
+client_secret.json
+.google_token.json

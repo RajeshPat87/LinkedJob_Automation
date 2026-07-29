@@ -20,6 +20,7 @@ import os
 import csv
 import re
 import time
+from urllib.parse import urlencode
 import pyautogui
 
 # Set CSV field size limit to prevent field size errors
@@ -45,6 +46,7 @@ from modules.open_chrome import *
 from modules.helpers import *
 from modules.clickers_and_finders import *
 from modules.validator import validate_config
+from modules.throttle import ApplicationPacer, is_soft_block_text
 
 if use_AI:
     from modules.ai.openaiConnections import ai_create_openai_client, ai_extract_skills, ai_answer_question, ai_close_openai_client
@@ -65,6 +67,21 @@ if run_in_background == True:
     pause_before_submit = False
     run_non_stop = False
 
+# Unattended mode, set by the cron job as UNATTENDED=1.
+# Several pyautogui dialogs block until a human clicks them - the sponsor message at startup,
+# the end of run summary, and the failure alerts. With nobody at the keyboard those hang the
+# process forever, holding the lock and never reaching the Google Sheets sync. Here they are
+# logged instead. The empty string return keeps the callers' == and `in` comparisons working.
+unattended = os.environ.get('UNATTENDED', '').strip().lower() in ('1', 'true', 'yes')
+if unattended:
+    def _log_instead_of_dialog(*args, **kwargs) -> str:
+        message = str(args[0]) if args else str(kwargs.get('text', ''))
+        print_lg(f"[unattended] dialog suppressed: {' '.join(message.split())[:160]}")
+        return ""
+    pyautogui.alert = _log_instead_of_dialog
+    pyautogui.confirm = _log_instead_of_dialog
+    pyautogui.prompt = _log_instead_of_dialog
+
 first_name = first_name.strip()
 middle_name = middle_name.strip()
 last_name = last_name.strip()
@@ -73,12 +90,21 @@ full_name = first_name + " " + middle_name + " " + last_name if middle_name else
 useNewResume = True
 randomly_answered_questions = set()
 
+# The location currently being searched. Recorded against every job so the country is known
+# from the search itself, instead of being re-derived from job card HTML that LinkedIn renames.
+current_search_location = ""
+
 tabs_count = 1
 easy_applied_count = 0
 external_jobs_count = 0
 failed_count = 0
 skip_count = 0
 dailyEasyApplyLimitReached = False
+soft_block_count = 0
+
+# Spaces out submissions so LinkedIn's "applying at a fast pace" safeguard is not triggered.
+pacer = ApplicationPacer(min_gap_between_applications, max_gap_between_applications,
+                         max_applications_per_hour, announce=print_lg)
 
 re_experience = re.compile(r'[(]?\s*(\d+)\s*[)]?\s*[-to]*\s*\d*[+]*\s*year[s]?', re.IGNORECASE)
 
@@ -181,20 +207,86 @@ def get_applied_job_ids() -> set[str]:
 
 
 
-def set_search_location() -> None:
+# LinkedIn's own search URL parameters. Setting filters here instead of clicking through the
+# "All filters" modal means they cannot silently fail: the modal's markup keeps changing, and
+# a failed click was leaving the search completely unfiltered (3 week old jobs, non Easy Apply
+# jobs) while only logging a one line warning.
+DATE_POSTED_PARAM = {
+    "Past 24 hours": "r86400",
+    "Past week": "r604800",
+    "Past month": "r2592000",
+    "Any time": "",
+}
+EXPERIENCE_PARAM = {"Internship": "1", "Entry level": "2", "Associate": "3",
+                    "Mid-Senior level": "4", "Director": "5", "Executive": "6"}
+JOB_TYPE_PARAM = {"Full-time": "F", "Part-time": "P", "Contract": "C", "Temporary": "T",
+                  "Volunteer": "V", "Internship": "I", "Other": "O"}
+ON_SITE_PARAM = {"On-site": "1", "Remote": "2", "Hybrid": "3"}
+SORT_BY_PARAM = {"Most recent": "DD", "Most relevant": "R"}
+
+# Filters with no URL equivalent. When any of these is set the modal is still needed.
+MODAL_ONLY_FILTERS = ('companies', 'industry', 'job_function', 'job_titles', 'benefits',
+                      'commitments', 'location', 'salary')
+
+
+def build_search_url(search_term: str, search_loc: str) -> str:
+    '''
+    Function to build a LinkedIn job search URL with the configured filters applied
+    * Takes in `search_term` of type `str` - the keywords to search for
+    * Takes in `search_loc` of type `str` - the location to search in
+    * Returns the full search URL
+    '''
+    params = {'keywords': search_term}
+    if search_loc.strip(): params['location'] = search_loc.strip()
+
+    date_param = DATE_POSTED_PARAM.get(date_posted, "")
+    if date_param: params['f_TPR'] = date_param
+    if easy_apply_only: params['f_AL'] = 'true'
+
+    for key, mapping, configured in (('f_E', EXPERIENCE_PARAM, experience_level),
+                                     ('f_JT', JOB_TYPE_PARAM, job_type),
+                                     ('f_WT', ON_SITE_PARAM, on_site)):
+        codes = [mapping[value] for value in configured if value in mapping]
+        if codes: params[key] = ",".join(codes)
+
+    if SORT_BY_PARAM.get(sort_by): params['sortBy'] = SORT_BY_PARAM[sort_by]
+
+    return "https://www.linkedin.com/jobs/search/?" + urlencode(params)
+
+
+def needs_filter_modal() -> bool:
+    '''
+    Function to check whether any configured filter has no URL equivalent
+    * Returns True only when the "All filters" modal is actually required
+    '''
+    return any(globals().get(name) for name in MODAL_ONLY_FILTERS)
+
+
+def get_search_locations() -> list[str]:
+    '''
+    Function to get the locations to search, highest priority first
+    * Uses `search_locations` from config/search.py when set, otherwise falls back to the
+      single `search_location`, so existing configs keep working unchanged
+    '''
+    configured = [location.strip() for location in (search_locations or []) if location.strip()]
+    return configured if configured else [search_location]
+
+
+def set_search_location(location: str) -> None:
     '''
     Function to set search location
+    * Takes in `location` of type `str` - the location to type into the search box
     '''
-    if search_location.strip():
+    if location.strip():
         try:
-            print_lg(f'Setting search location as: "{search_location.strip()}"')
+            print_lg(f'Setting search location as: "{location.strip()}"')
             search_location_ele = try_xp(driver, ".//input[@aria-label='City, state, or zip code'and not(@disabled)]", False) #  and not(@aria-hidden='true')]")
-            text_input(actions, search_location_ele, search_location, "Search Location")
+            text_input(actions, search_location_ele, location, "Search Location")
         except ElementNotInteractableException:
             try_xp(driver, ".//label[@class='jobs-search-box__input-icon jobs-search-box__keywords-label']")
             actions.send_keys(Keys.TAB, Keys.TAB).perform()
             actions.key_down(Keys.CONTROL).send_keys("a").key_up(Keys.CONTROL).perform()
-            actions.send_keys(search_location.strip()).perform()
+            actions.send_keys(location.strip()).perform()
             sleep(2)
             actions.send_keys(Keys.ENTER).perform()
             try_xp(driver, ".//button[@aria-label='Cancel']")
@@ -203,11 +295,16 @@ def set_search_location() -> None:
             print_lg("Failed to update search location, continuing with default location!", e)
 
 
-def apply_filters() -> None:
+def apply_filters(search_loc: str) -> None:
     '''
     Function to apply job search filters
+    * Takes in `search_loc` of type `str` - the location to type into the search box
+
+    Named `search_loc`, not `location`: `location` is already a config global holding the
+    dynamic location filter list, and shadowing it made multi_sel_noWait iterate the search
+    string character by character.
     '''
-    set_search_location()
+    set_search_location(search_loc)
 
     try:
         recommended_wait = 1 if click_gap < 1 else 0
@@ -279,6 +376,74 @@ def get_page_info() -> tuple[WebElement | None, int | None]:
 
 
 
+# LinkedIn's wording when an account has used up its allowance of applications for the day.
+DAILY_LIMIT_MESSAGE = "LinkedIn's daily application limit has been reached for this account."
+DAILY_LIMIT_HINT = "we limit daily submissions"
+
+
+class DailyLimitReached(Exception):
+    '''Raised when LinkedIn has capped applications for the day, so the run should stop.'''
+
+
+def daily_limit_reached() -> bool:
+    '''
+    Function to detect LinkedIn's daily application cap on an open job page
+    * Returns True when the apply button is present but disabled and LinkedIn shows its
+      "we limit daily submissions ... apply tomorrow" notice
+
+    Both conditions are required: a disabled button on its own can mean an expired posting,
+    and the notice alone should not stop a run where applying still works.
+    '''
+    try:
+        buttons = driver.find_elements(By.XPATH, "//button[contains(@class,'jobs-apply-button')]")
+        if not buttons or any(button.is_enabled() for button in buttons): return False
+        return DAILY_LIMIT_HINT in driver.find_element(By.TAG_NAME, 'body').text.lower()
+    except Exception:
+        return False
+
+
+class ApplyPaused(Exception):
+    '''Raised when LinkedIn's temporary "applying at a fast pace" pause outlasts our retries.'''
+
+
+def soft_block_active() -> bool:
+    '''
+    Function to detect LinkedIn's temporary rate-limit notice ("We noticed you're applying at
+    a fast pace ... we've briefly paused LinkedIn Apply") anywhere on the current page or in
+    the Easy Apply modal.
+    '''
+    try:
+        return is_soft_block_text(driver.find_element(By.TAG_NAME, 'body').text)
+    except Exception:
+        return False
+
+
+def handle_soft_block() -> None:
+    '''
+    Function to back off when LinkedIn has paused applying. Waits `soft_block_cooldown_minutes`
+    and lets the run continue, or raises `ApplyPaused` once the run has used up
+    `max_soft_block_retries` (or when the cooldown is configured to 0).
+
+    Applying through the pause only extends it, so waiting is the only way to finish the run.
+    '''
+    global soft_block_count
+    soft_block_count += 1
+    print_lg("\n{}\nLinkedIn has temporarily paused applying for this account "
+             "(\"applying at a fast pace\" safeguard). Occurrence {} of this run.\n{}\n"
+             .format("="*70, soft_block_count, "="*70))
+    if soft_block_cooldown_minutes <= 0 or soft_block_count > max_soft_block_retries:
+        raise ApplyPaused("LinkedIn paused applying and the configured cooldowns are used up.")
+    try: screenshot(driver, "rate_limit", "LinkedIn paused applying")
+    except Exception as e: print_lg("Couldn't capture the rate limit screenshot.", e)
+    print_lg("Cooling down for {} min before applying again. "
+             "Consider lowering max_applications_per_hour in config/settings.py."
+             .format(soft_block_cooldown_minutes))
+    sleep(soft_block_cooldown_minutes * 60)
+    print_lg("Cooldown finished, resuming applications.")
+    try: driver.refresh()
+    except Exception as e: print_lg("Couldn't refresh the page after the cooldown.", e)
+
+
 def dismiss_modal_overlay(attempts: int = 3) -> bool:
     '''
     Function to close any leftover LinkedIn modal whose overlay covers the job list and
@@ -291,6 +456,31 @@ def dismiss_modal_overlay(attempts: int = 3) -> bool:
         wait_span_click(driver, 'Discard', 1, scroll=False)
         time.sleep(0.5)
     return not driver.find_elements(By.CLASS_NAME, "artdeco-modal-overlay")
+
+
+# LinkedIn keeps renaming the element that holds the job card's location. These are the known
+# class names, newest first; "job-card-container__metadata-item" is the pre-2026 name that
+# silently stopped matching and left every Work Location as "Unknown".
+LOCATION_CLASS_CANDIDATES = (
+    "artdeco-entity-lockup__caption",
+    "job-card-container__metadata-wrapper",
+    "job-card-container__metadata-item",
+)
+
+
+def extract_work_location(job: WebElement) -> str:
+    '''
+    Function to read the work location from a job card
+    * Takes in `job` of type `WebElement` - the job card
+    * Returns the location text, or "Unknown" when none of the known markups match
+    '''
+    for class_name in LOCATION_CLASS_CANDIDATES:
+        try:
+            text = job.find_element(By.CLASS_NAME, class_name).text.strip()
+            if text: return text.split("\n")[0].strip()
+        except NoSuchElementException:
+            continue
+    return "Unknown"
 
 
 def get_job_main_details(job: WebElement, blacklisted_companies: set, rejected_jobs: set) -> tuple[str, str, str, str, str, bool]:
@@ -315,13 +505,11 @@ def get_job_main_details(job: WebElement, blacklisted_companies: set, rejected_j
     other_details = job.find_element(By.CLASS_NAME, 'artdeco-entity-lockup__subtitle').text
     index = other_details.find(' · ')
     if index == -1:
-        # LinkedIn now often puts only the company in the subtitle and the location in its own
+        # LinkedIn now puts only the company in the subtitle and the location in its own
         # element. Slicing on index = -1 silently chopped characters off all three fields
         # (e.g. "Ingram Micro" -> "Ingram Micr"), so read them separately instead.
         company = other_details.strip()
-        work_location = "Unknown"
-        try: work_location = job.find_element(By.CLASS_NAME, "job-card-container__metadata-item").text.strip()
-        except NoSuchElementException: pass
+        work_location = extract_work_location(job)
     else:
         company = other_details[:index].strip()
         work_location = other_details[index+3:].strip()
@@ -875,10 +1063,10 @@ def failed_job(job_id: str, job_link: str, resume: str, date_listed, error: str,
     '''
     try:
         with open(failed_file_name, 'a', newline='', encoding='utf-8') as file:
-            fieldnames = ['Job ID', 'Job Link', 'Resume Tried', 'Date listed', 'Date Tried', 'Assumed Reason', 'Stack Trace', 'External Job link', 'Screenshot Name']
+            fieldnames = ['Job ID', 'Job Link', 'Resume Tried', 'Date listed', 'Date Tried', 'Assumed Reason', 'Stack Trace', 'External Job link', 'Screenshot Name', 'Search Location']
             writer = csv.DictWriter(file, fieldnames=fieldnames)
             if file.tell() == 0: writer.writeheader()
-            writer.writerow({'Job ID':truncate_for_csv(job_id), 'Job Link':truncate_for_csv(job_link), 'Resume Tried':truncate_for_csv(resume), 'Date listed':truncate_for_csv(date_listed), 'Date Tried':datetime.now(), 'Assumed Reason':truncate_for_csv(error), 'Stack Trace':truncate_for_csv(exception), 'External Job link':truncate_for_csv(application_link), 'Screenshot Name':truncate_for_csv(screenshot_name)})
+            writer.writerow({'Job ID':truncate_for_csv(job_id), 'Job Link':truncate_for_csv(job_link), 'Resume Tried':truncate_for_csv(resume), 'Date listed':truncate_for_csv(date_listed), 'Date Tried':datetime.now(), 'Assumed Reason':truncate_for_csv(error), 'Stack Trace':truncate_for_csv(exception), 'External Job link':truncate_for_csv(application_link), 'Screenshot Name':truncate_for_csv(screenshot_name), 'Search Location':truncate_for_csv(current_search_location)})
             file.close()
     except Exception as e:
         print_lg("Failed to update failed jobs list!", e)
@@ -909,7 +1097,7 @@ def submitted_jobs(job_id: str, title: str, company: str, work_location: str, wo
     '''
     try:
         with open(file_name, mode='a', newline='', encoding='utf-8') as csv_file:
-            fieldnames = ['Job ID', 'Title', 'Company', 'Work Location', 'Work Style', 'Status', 'About Job', 'Experience required', 'Skills required', 'HR Name', 'HR Link', 'Resume', 'Re-posted', 'Date Posted', 'Date Applied', 'Job Link', 'External Job link', 'Questions Found', 'Connect Request']
+            fieldnames = ['Job ID', 'Title', 'Company', 'Work Location', 'Work Style', 'Status', 'About Job', 'Experience required', 'Skills required', 'HR Name', 'HR Link', 'Resume', 'Re-posted', 'Date Posted', 'Date Applied', 'Job Link', 'External Job link', 'Questions Found', 'Connect Request', 'Search Location']
             writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
             if csv_file.tell() == 0: writer.writeheader()
             status = "Easy Applied" if application_link == "Easy Applied" else "External link collected"
@@ -917,7 +1105,7 @@ def submitted_jobs(job_id: str, title: str, company: str, work_location: str, wo
                             'About Job':truncate_for_csv(description), 'Experience required': truncate_for_csv(experience_required), 'Skills required':truncate_for_csv(skills), 
                                 'HR Name':truncate_for_csv(hr_name), 'HR Link':truncate_for_csv(hr_link), 'Resume':truncate_for_csv(resume), 'Re-posted':truncate_for_csv(reposted), 
                                 'Date Posted':truncate_for_csv(date_listed), 'Date Applied':truncate_for_csv(date_applied), 'Job Link':truncate_for_csv(job_link), 
-                                'External Job link':truncate_for_csv(application_link), 'Questions Found':truncate_for_csv(questions_list), 'Connect Request':truncate_for_csv(connect_request)})
+                                'External Job link':truncate_for_csv(application_link), 'Questions Found':truncate_for_csv(questions_list), 'Connect Request':truncate_for_csv(connect_request), 'Search Location':truncate_for_csv(current_search_location)})
         csv_file.close()
     except Exception as e:
         print_lg("Failed to update submitted jobs list!", e)
@@ -940,16 +1128,38 @@ def apply_to_jobs(search_terms: list[str]) -> None:
     applied_jobs = get_applied_job_ids()
     rejected_jobs = set()
     blacklisted_companies = set()
-    global current_city, failed_count, skip_count, easy_applied_count, external_jobs_count, tabs_count, pause_before_submit, pause_at_failed_question, useNewResume
+    global current_city, failed_count, skip_count, easy_applied_count, external_jobs_count, tabs_count, pause_before_submit, pause_at_failed_question, useNewResume, current_search_location
     current_city = current_city.strip()
 
     if randomize_search_order:  shuffle(search_terms)
-    for searchTerm in search_terms:
-        driver.get(f"https://www.linkedin.com/jobs/search/?keywords={searchTerm}")
+    # Location is the outer loop, so the highest priority location is searched across every
+    # search term before moving down to the next one.
+    searches = [(location, searchTerm)
+                for location in get_search_locations() for searchTerm in search_terms]
+    print_lg(f'\nSearching {len(search_terms)} term(s) across {len(get_search_locations())} '
+             f'location(s) in priority order: {", ".join(get_search_locations())}\n')
+    for search_loc, searchTerm in searches:
+        current_search_location = search_loc
+        search_url = build_search_url(searchTerm, current_search_location)
         print_lg("\n________________________________________________________________________________________________________________________\n")
-        print_lg(f'\n>>>> Now searching for "{searchTerm}" <<<<\n\n')
+        print_lg(f'\n>>>> Now searching for "{searchTerm}" in "{current_search_location}" <<<<\n')
+        print_lg(f'Search URL: {search_url}\n')
 
-        apply_filters()
+        # Navigation used to sit outside the try below, so one wedged page load ended the
+        # whole run instead of just this search. With 72 searches queued that threw away
+        # every remaining location.
+        try:
+            dismiss_modal_overlay()
+            driver.get(search_url)
+            # Filters now travel in the URL, so the fragile "All filters" modal is only
+            # opened when a filter that has no URL equivalent is configured.
+            if needs_filter_modal(): apply_filters(current_search_location)
+        except (NoSuchWindowException, InvalidSessionIdException):
+            raise   # Browser is genuinely gone, let the outer handler end the run
+        except Exception as e:
+            print_lg(f'Failed to open search "{searchTerm}" in "{current_search_location}", skipping to the next one.', e)
+            critical_error_log("In Applier Search Setup", e)
+            continue
 
         current_count = 0
         try:
@@ -1082,9 +1292,24 @@ def apply_to_jobs(search_terms: list[str]) -> None:
 
                     uploaded = False
                     external_link = None    # Set when a fallback below already opened the employer's application tab
+
+                    # LinkedIn caps how many applications an account can submit per day. Past the
+                    # cap every apply button is rendered disabled, which used to be recorded as
+                    # "didn't find Apply button" against every remaining job. Stop instead: the
+                    # cap is account wide, so no later job in this run can succeed either.
+                    if daily_limit_reached():
+                        raise DailyLimitReached(DAILY_LIMIT_MESSAGE)
+
+                    # LinkedIn briefly pauses applying when submissions come in too fast. Every
+                    # apply during that window fails, so back off instead of spending the run
+                    # on failures - and keep the pace under the threshold to begin with.
+                    if soft_block_active(): handle_soft_block()
+                    pacer.wait_for_slot()
+
                     # Case 1: Easy Apply Button
-                    # First try the classic button with "Easy" in aria-label
-                    is_easy_apply = try_xp(driver, ".//button[contains(@class,'jobs-apply-button') and contains(@class, 'artdeco-button--3') and contains(@aria-label, 'Easy')]")
+                    # The aria-label reads "LinkedIn Apply to <job title>" - it does not contain
+                    # the word "Easy", so matching on that missed every Easy Apply job.
+                    is_easy_apply = try_xp(driver, ".//button[contains(@class,'jobs-apply-button') and (contains(@aria-label, 'Easy') or contains(@aria-label, 'LinkedIn Apply') or normalize-space()='Easy Apply')]")
                     # Fallback 1: check if apply link contains Easy Apply URL pattern
                     if not is_easy_apply:
                         try:
@@ -1180,6 +1405,12 @@ def apply_to_jobs(search_terms: list[str]) -> None:
                         except Exception as e:
                             print_lg("Failed to Easy apply!")
                             # print_lg(e)
+                            # The rate-limit pause surfaces as an ordinary Easy Apply failure, so
+                            # check for it here before writing the job off as failed.
+                            if soft_block_active():
+                                discard_job()
+                                handle_soft_block()
+                                continue
                             critical_error_log("Somewhere in Easy Apply process",e)
                             failed_job(job_id, job_link, resume, date_listed, "Problem in Easy Applying", e, application_link, screenshot_name)
                             failed_count += 1
@@ -1205,7 +1436,9 @@ def apply_to_jobs(search_terms: list[str]) -> None:
 
                     print_lg(f'Successfully saved "{title} | {company}" job. Job ID: {job_id} info')
                     current_count += 1
-                    if application_link == "Easy Applied": easy_applied_count += 1
+                    if application_link == "Easy Applied":
+                        easy_applied_count += 1
+                        pacer.record_application()  # Only submissions count towards LinkedIn's rate
                     else:   external_jobs_count += 1
                     applied_jobs.add(job_id)
 
@@ -1215,13 +1448,34 @@ def apply_to_jobs(search_terms: list[str]) -> None:
                 if pagination_element == None:
                     print_lg("Couldn't find pagination element, probably at the end page of results!")
                     break
+                # A leftover "discard application?" modal covers the pagination bar and makes
+                # the click land on the overlay instead. Left alone it blocks every later
+                # action until the browser stops responding and the whole run is abandoned.
+                dismiss_modal_overlay()
                 try:
-                    pagination_element.find_element(By.XPATH, f"//button[@aria-label='Page {current_page+1}']").click()
+                    next_page_button = pagination_element.find_element(By.XPATH, f"//button[@aria-label='Page {current_page+1}']")
+                    try:
+                        next_page_button.click()
+                    except ElementClickInterceptedException:
+                        print_lg("Pagination click was intercepted, clearing the overlay and retrying.")
+                        dismiss_modal_overlay()
+                        next_page_button.click()
                     print_lg(f"\n>-> Now on Page {current_page+1} \n")
                 except NoSuchElementException:
                     print_lg(f"\n>-> Didn't find Page {current_page+1}. Probably at the end page of results!\n")
                     break
 
+        except ApplyPaused as e:
+            # Account wide like the daily cap, so later searches would hit the same pause.
+            print_lg(f"\n{'='*70}\n{e}\nStopping the run to let the account cool off.\n"
+                     f"Lower `max_applications_per_hour` or raise the gap settings in config/settings.py "
+                     f"before the next run.\n{'='*70}\n")
+            break
+        except DailyLimitReached as e:
+            # Account wide, so no further search or location can apply either today.
+            print_lg(f"\n{'='*70}\n{e}\nStopping the run - remaining searches would all be blocked.\n"
+                     f"Applications reset after about 24 hours.\n{'='*70}\n")
+            break
         except (NoSuchWindowException, WebDriverException) as e:
             # ElementClickInterceptedException & friends are WebDriverException subclasses, so
             # confirm the session is actually dead before writing off the whole run.

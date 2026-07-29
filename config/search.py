@@ -24,6 +24,12 @@ search_terms = ["DevOps Engineer", "Senior DevOps Engineer", "Platform Engineer"
 # Search location, this will be filled in "City, state, or zip code" search box. If left empty as "", tool will not fill it.
 search_location = "India"                       # Some valid examples: "", "United States", "India", "Chicago, Illinois, United States", "90001, Los Angeles, California, United States", "Bengaluru, Karnataka, India", etc.
 
+# Locations to search, highest priority first. The bot works through this list in order, so the
+# first location is fully searched (up to switch_number per search term) before moving on.
+# The same order ranks the Country column in the Google Sheets exports.
+# Leave the list empty as [] to search only `search_location` above.
+search_locations = ["India", "United Arab Emirates", "Singapore", "Netherlands", "Australia", "Japan"]
+
 # After how many number of applications in current search should the bot switch to next search? 
 switch_number = 30                 # Only numbers greater than 0... Don't put in quotes
 
@@ -49,7 +55,7 @@ This is below format: QUESTION = VALID_ANSWER
 '''
 
 sort_by = ""                       # "Most recent", "Most relevant" or ("" to not select) 
-date_posted = "Past week"         # "Any time", "Past month", "Past week", "Past 24 hours" or ("" to not select)
+date_posted = "Past 24 hours"     # "Any time", "Past month", "Past week", "Past 24 hours" or ("" to not select)
 salary = ""                        # "$40,000+", "$60,000+", "$80,000+", "$100,000+", "$120,000+", "$140,000+", "$160,000+", "$180,000+", "$200,000+"
 
 easy_apply_only = True             # True or False, Note: True or False are case-sensitive
@@ -75,7 +81,7 @@ fair_chance_employer = False       # True or False, Note: True or False are case
 ## >>>>>>>>>>> RELATED SETTING <<<<<<<<<<<
 
 # Pause after applying filters to let you modify the search results and filters?
-pause_after_filters = True         # True or False, Note: True or False are case-sensitive
+pause_after_filters = False        # True or False, Note: True or False are case-sensitive
 
 ##
 

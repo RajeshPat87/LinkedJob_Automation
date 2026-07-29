@@ -44,6 +44,27 @@ follow_companies = False            # True or False, Note: True or False are cas
 # # What message do you want to send during connection request? (Max. 200 Characters)
 # connect_request_message = ""       # Leave Empty to send connection request without personalized invitation (recommended to leave it empty, since you only get 10 per month without LinkedIn Premium*)
 
+# >>>>>>>>>>> Application pacing <<<<<<<<<<<
+'''
+LinkedIn watches how fast an account submits applications. Past a certain rate it shows
+"We noticed you're applying at a fast pace ... we've briefly paused LinkedIn Apply" and
+every following Easy Apply fails until the pause lifts. These settings keep the run under
+that rate and make it back off instead of burning through jobs as failures.
+'''
+
+# Wait this many seconds between two application submissions (a random value in the range is used)
+min_gap_between_applications = 45   # Non negative integer, seconds
+max_gap_between_applications = 120  # Non negative integer, seconds. Must be >= min_gap_between_applications
+
+# Hard ceiling on submissions per rolling hour. Set to 0 to disable the hourly cap.
+max_applications_per_hour = 15      # Non negative integer
+
+# When LinkedIn shows the "applying at a fast pace" pause, wait this long before trying again
+soft_block_cooldown_minutes = 45    # Non negative integer, minutes. Set to 0 to stop the run instead of waiting
+
+# How many times a run may sit through that cooldown before giving up for the day
+max_soft_block_retries = 2          # Non negative integer
+
 # Do you want the program to run continuously until you stop it? (Beta)
 run_non_stop = False                # True or False, Note: True or False are case-sensitive
 '''

@@ -8,3 +8,5 @@ flask-cors
 fpdf2
 python-docx
 setuptools
+google-auth-oauthlib
+google-api-python-client

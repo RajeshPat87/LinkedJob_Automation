@@ -209,6 +209,14 @@ def validate_settings() -> None | ValueError | TypeError:
 
     check_int(click_gap, "click_gap", 0)
 
+    check_int(min_gap_between_applications, "min_gap_between_applications", 0)
+    check_int(max_gap_between_applications, "max_gap_between_applications", 0)
+    if max_gap_between_applications < min_gap_between_applications:
+        raise ValueError("max_gap_between_applications must be greater than or equal to min_gap_between_applications!")
+    check_int(max_applications_per_hour, "max_applications_per_hour", 0)
+    check_int(soft_block_cooldown_minutes, "soft_block_cooldown_minutes", 0)
+    check_int(max_soft_block_retries, "max_soft_block_retries", 0)
+
     check_boolean(run_in_background, "run_in_background")
     check_boolean(disable_extensions, "disable_extensions")
     check_boolean(safe_mode, "safe_mode")
