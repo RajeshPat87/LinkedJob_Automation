@@ -1299,9 +1299,14 @@ def easy_apply_new_ui(job_id: str, work_location: str, description: str | None) 
         print_lg("Answered the following questions...", questions_list)
 
     if pause_before_submit:
-        decision = pyautogui.confirm('1. Please verify your information.\n2. If you edited something, please return to this final screen.\n3. DO NOT CLICK "Submit application".\n\n\nYou can turn off "Pause before submit" in config/settings.py',
+        decision = pyautogui.confirm('1. Please verify your information.\n2. If you edited something, please return to this final screen.\n3. DO NOT CLICK "Submit application".\n\n\nYou can turn off "Pause before submit" in config/questions.py',
                                      "Confirm your information", ["Disable Pause", "Discard Application", "Submit Application"])
-        if decision == "Discard Application": raise Exception("Job application discarded by user!")
+        # Fail closed. The dialog can return without a human ever seeing it - under WSLg it may
+        # not draw at all - and anything other than an explicit approval used to fall through to
+        # the submit below, applying to the job the pause existed to hold back.
+        if decision not in ("Submit Application", "Disable Pause"):
+            raise Exception(f'Submit was not confirmed (the dialog returned {decision!r}), '
+                            f'discarding this application instead of sending it.')
         pause_before_submit = False if decision == "Disable Pause" else True
         submit = apply_flow.submit_button(driver) or submit
 

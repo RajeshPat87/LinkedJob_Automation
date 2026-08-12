@@ -46,12 +46,34 @@ def get_installed_chrome_major_version() -> int | None:
         return None
 ##<
 
+def is_wsl() -> bool:
+    '''
+    Returns `True` when running under WSL, which needs its own browser window flags.
+    '''
+    try:
+        with open('/proc/version', 'r') as version_file:
+            return 'microsoft' in version_file.read().lower()
+    except Exception:
+        return False
+
+
 def createChromeSession(isRetry: bool = False):
     make_directories([file_name,failed_file_name,logs_folder_path+"/screenshots",default_resume_path,generated_resume_path+"/temp"])
     # Set up WebDriver with Chrome Profile
     options = uc.ChromeOptions() if stealth_mode else Options()
     if run_in_background:   options.add_argument("--headless")
     if disable_extensions:  options.add_argument("--disable-extensions")
+
+    ##> ------ Local fix : Make the window actually render under WSL/WSLg ------
+    # On WSL the browser window opens but paints blank, so there is nothing to watch even
+    # with run_in_background = False. WSLg advertises a Wayland display, and Chrome's Wayland
+    # path plus its GPU compositor is what comes up empty; forcing the X11 backend and the
+    # software compositor makes the page draw. No effect anywhere else, and none when headless.
+    if not run_in_background and is_wsl():
+        options.add_argument("--ozone-platform=x11")
+        options.add_argument("--disable-gpu")
+        options.add_argument("--disable-features=VizDisplayCompositor")
+    ##<
 
     print_lg("IF YOU HAVE MORE THAN 10 TABS OPENED, PLEASE CLOSE OR BOOKMARK THEM! Or it's highly likely that application will just open browser and not do anything!")
     profile_dir = find_default_profile_directory()
