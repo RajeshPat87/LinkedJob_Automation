@@ -34,7 +34,14 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support.select import Select
 from selenium.webdriver.remote.webelement import WebElement
-from selenium.common.exceptions import NoSuchElementException, ElementClickInterceptedException, NoSuchWindowException, ElementNotInteractableException, WebDriverException, InvalidSessionIdException
+from selenium.common.exceptions import NoSuchElementException, ElementClickInterceptedException, NoSuchWindowException, ElementNotInteractableException, WebDriverException, InvalidSessionIdException, TimeoutException
+
+from modules import apply_flow
+from modules.linkedin_ui import (about_company_text, extract_job_id, find_apply_dialog,
+                                 find_external_apply_button, find_linkedin_apply_button,
+                                 go_to_next_page, is_new_ui, is_new_ui_card, job_description_text,
+                                 load_all_job_cards, parse_new_ui_card, resolve_geo_id,
+                                 wait_for_job_cards, NO_RESULTS_MARKERS)
 
 from config.personals import *
 from config.questions import *
@@ -237,7 +244,16 @@ def build_search_url(search_term: str, search_loc: str) -> str:
     * Returns the full search URL
     '''
     params = {'keywords': search_term}
-    if search_loc.strip(): params['location'] = search_loc.strip()
+    location = search_loc.strip()
+    if location:
+        params['location'] = location
+        # LinkedIn's AI search discards `location` and silently falls back to the profile's own
+        # location, so every search ran against the wrong place. It keys off `geoId` instead,
+        # which the classic UI also accepts - so sending both is safe on either rollout.
+        geo_id = resolve_geo_id(location)
+        if geo_id: params['geoId'] = geo_id
+        else: print_lg(f'No geoId known for "{location}". On LinkedIn\'s AI search this falls back '
+                       f'to your profile location - add it to GEO_IDS in modules/linkedin_ui.py.')
 
     date_param = DATE_POSTED_PARAM.get(date_posted, "")
     if date_param: params['f_TPR'] = date_param
@@ -363,6 +379,9 @@ def get_page_info() -> tuple[WebElement | None, int | None]:
     '''
     Function to get pagination element and current page number
     '''
+    # The AI search paginates through a data-testid button instead, handled by go_to_next_page.
+    # Looking for the artdeco bar there logged a scary failure on every single page.
+    if is_new_ui(driver): return None, None
     try:
         pagination_element = try_find_by_classes(driver, ["jobs-search-pagination__pages", "artdeco-pagination", "artdeco-pagination__pages"])
         scroll_to_view(driver, pagination_element)
@@ -483,6 +502,37 @@ def extract_work_location(job: WebElement) -> str:
     return "Unknown"
 
 
+def log_no_job_cards(search_term: str, search_loc: str) -> None:
+    '''
+    Function to record why a search rendered no job cards
+    * A bare `TimeoutException` prints an empty message, so every failed search used to look
+      identical. This logs the page state that actually distinguishes the causes.
+    '''
+    try:
+        url, title, page = driver.current_url, driver.title, driver.page_source.lower()
+    except Exception as e:
+        print_lg("Couldn't read the page to explain the empty results list.", e)
+        return
+
+    if any(marker in page for marker in NO_RESULTS_MARKERS):
+        reason = ("LinkedIn returned no matching jobs for these filters. Try widening "
+                  "`date_posted`, `experience_level` or `job_type` in config/search.py.")
+    elif any(marker in url for marker in ("/authwall", "/login", "/checkpoint", "/uas/login")):
+        reason = ("LinkedIn dropped the session or asked for verification. Log in manually in "
+                  "the bot's Chrome profile, then re-run.")
+    else:
+        reason = ("The results list rendered no markup this bot recognises - LinkedIn most likely "
+                  "renamed the job card again. Check the screenshot and page source, then add the "
+                  "new selector to JOB_CARD_SELECTORS in modules/linkedin_ui.py.")
+
+    print_lg(f'No job cards for "{search_term}" in "{search_loc}". {reason}')
+    print_lg(f'Page URL: {url}\nPage title: {title}')
+    try:
+        print_lg(f'Saved screenshot: {screenshot(driver, "no-job-cards", f"{search_term} in {search_loc}")}')
+    except Exception as e:
+        print_lg("Couldn't save a screenshot of the empty results page.", e)
+
+
 def get_job_main_details(job: WebElement, blacklisted_companies: set, rejected_jobs: set) -> tuple[str, str, str, str, str, bool]:
     '''
     # Function to get job main details.
@@ -495,24 +545,30 @@ def get_job_main_details(job: WebElement, blacklisted_companies: set, rejected_j
     * skip: A boolean flag to skip this job
     '''
     skip = False
-    job_details_button = job.find_element(By.TAG_NAME, 'a')  # job.find_element(By.CLASS_NAME, "job-card-list__title")  # Problem in India
+    new_ui = is_new_ui_card(job)
+    # The AI search's card holds no anchor at all - the card itself is the click target.
+    job_details_button = job if new_ui else job.find_element(By.TAG_NAME, 'a')  # job.find_element(By.CLASS_NAME, "job-card-list__title")  # Problem in India
     scroll_to_view(driver, job_details_button, True)
-    job_id = job.get_dom_attribute('data-occludable-job-id')
-    title = job_details_button.text
-    title = title[:title.find("\n")]
-    # company = job.find_element(By.CLASS_NAME, "job-card-container__primary-description").text
-    # work_location = job.find_element(By.CLASS_NAME, "job-card-container__metadata-item").text
-    other_details = job.find_element(By.CLASS_NAME, 'artdeco-entity-lockup__subtitle').text
-    index = other_details.find(' · ')
-    if index == -1:
-        # LinkedIn now puts only the company in the subtitle and the location in its own
-        # element. Slicing on index = -1 silently chopped characters off all three fields
-        # (e.g. "Ingram Micro" -> "Ingram Micr"), so read them separately instead.
-        company = other_details.strip()
-        work_location = extract_work_location(job)
+    job_id = extract_job_id(job)
+    applied_on_card = False
+    if new_ui:
+        title, company, work_location, applied_on_card = parse_new_ui_card(job)
     else:
-        company = other_details[:index].strip()
-        work_location = other_details[index+3:].strip()
+        title = job_details_button.text
+        title = title[:title.find("\n")]
+        # company = job.find_element(By.CLASS_NAME, "job-card-container__primary-description").text
+        # work_location = job.find_element(By.CLASS_NAME, "job-card-container__metadata-item").text
+        other_details = job.find_element(By.CLASS_NAME, 'artdeco-entity-lockup__subtitle').text
+        index = other_details.find(' · ')
+        if index == -1:
+            # LinkedIn now puts only the company in the subtitle and the location in its own
+            # element. Slicing on index = -1 silently chopped characters off all three fields
+            # (e.g. "Ingram Micro" -> "Ingram Micr"), so read them separately instead.
+            company = other_details.strip()
+            work_location = extract_work_location(job)
+        else:
+            company = other_details[:index].strip()
+            work_location = other_details[index+3:].strip()
     work_style = "Unknown"
     if '(' in work_location and ')' in work_location:
         work_style = work_location[work_location.rfind('(')+1:work_location.rfind(')')].strip()
@@ -525,11 +581,17 @@ def get_job_main_details(job: WebElement, blacklisted_companies: set, rejected_j
     elif job_id in rejected_jobs: 
         print_lg(f'Skipping previously rejected "{title} | {company}" job. Job ID: {job_id}!')
         skip = True
-    try:
-        if job.find_element(By.CLASS_NAME, "job-card-container__footer-job-state").text == "Applied":
-            skip = True
-            print_lg(f'Already applied to "{title} | {company}" job. Job ID: {job_id}!')
-    except: pass
+    # The AI search has no footer-job-state element; it prints "Applied" as one of the card's
+    # badge lines, which parse_new_ui_card already picked up.
+    if applied_on_card:
+        skip = True
+        print_lg(f'Already applied to "{title} | {company}" job. Job ID: {job_id}!')
+    elif not new_ui:
+        try:
+            if job.find_element(By.CLASS_NAME, "job-card-container__footer-job-state").text == "Applied":
+                skip = True
+                print_lg(f'Already applied to "{title} | {company}" job. Job ID: {job_id}!')
+        except: pass
     if not skip:
         try:
             job_details_button.click()
@@ -558,10 +620,27 @@ def get_job_main_details(job: WebElement, blacklisted_companies: set, rejected_j
 
 # Function to check for Blacklisted words in About Company
 def check_blacklist(rejected_jobs: set, job_id: str, company: str, blacklisted_companies: set) -> tuple[set, set, WebElement] | ValueError:
-    jobs_top_card = try_find_by_classes(driver, ["job-details-jobs-unified-top-card__primary-description-container","job-details-jobs-unified-top-card__primary-description","jobs-unified-top-card__primary-description","jobs-details__main-content"])
-    about_company_org = find_by_class(driver, "jobs-company__box")
-    scroll_to_view(driver, about_company_org)
-    about_company_org = about_company_org.text
+    # The AI search replaced `.jobs-company__box` with an id keyed by job id. Read that first;
+    # without it every job raised NoSuchElement and the blacklist was never actually applied.
+    about_company_org = about_company_text(driver, job_id)
+    jobs_top_card = None
+    if not about_company_org and is_new_ui(driver):
+        # Say so plainly: silently reading "" here would let every blacklisted company through
+        # while the run still looked healthy.
+        print_lg(f"About the Company isn't available for job {job_id}, "
+                 f"so the company blacklist can't be checked for it.")
+        for element in driver.find_elements(By.ID, f"JobDetails_AboutTheJob_{job_id}"):
+            return rejected_jobs, blacklisted_companies, element
+        return rejected_jobs, blacklisted_companies, None
+    if about_company_org:
+        for element in driver.find_elements(By.ID, f"JobDetails_AboutTheJob_{job_id}"):
+            jobs_top_card = element
+            break
+    else:
+        jobs_top_card = try_find_by_classes(driver, ["job-details-jobs-unified-top-card__primary-description-container","job-details-jobs-unified-top-card__primary-description","jobs-unified-top-card__primary-description","jobs-details__main-content"])
+        about_company_element = find_by_class(driver, "jobs-company__box")
+        scroll_to_view(driver, about_company_element)
+        about_company_org = about_company_element.text
     about_company = about_company_org.lower()
     skip_checking = False
     for word in about_company_good_words:
@@ -576,7 +655,7 @@ def check_blacklist(rejected_jobs: set, job_id: str, company: str, blacklisted_c
                 blacklisted_companies.add(company)
                 raise ValueError(f'\n"{about_company_org}"\n\nContains "{word}".')
     buffer(click_gap)
-    scroll_to_view(driver, jobs_top_card)
+    if jobs_top_card is not None: scroll_to_view(driver, jobs_top_card)
     return rejected_jobs, blacklisted_companies, jobs_top_card
 
 
@@ -666,6 +745,96 @@ def answer_common_questions(label: str, answer: str) -> str:
     if 'sponsorship' in label or 'visa' in label: answer = require_visa
     return answer
 
+
+
+
+def resolve_text_answer(label: str, label_org: str, work_location: str,
+                        job_description: str | None = None) -> tuple[str, bool]:
+    '''
+    Function to decide the answer for a free-text question
+    * Takes in `label` of type `str` - the question text, lowercased
+    * Takes in `label_org` of type `str` - the question as shown, used for AI and logging
+    * Returns a tuple of (answer, needs_typeahead), falling back to the AI provider and then
+      to `years_of_experience`
+    * `needs_typeahead` is True for the location questions whose field only accepts a value
+      picked from its dropdown
+
+    Extracted so LinkedIn's AI search apply flow answers questions identically to the classic
+    Easy Apply modal instead of carrying a second, drifting copy of these rules.
+    '''
+    answer = ""
+    do_actions = False
+    if 'experience' in label or 'years' in label: answer = years_of_experience
+    elif 'phone' in label or 'mobile' in label: answer = phone_number
+    elif 'street' in label: answer = street
+    elif 'city' in label or 'location' in label or 'address' in label:
+        answer = current_city if current_city else work_location
+        do_actions = True
+    elif 'signature' in label: answer = full_name # 'signature' in label or 'legal name' in label or 'your name' in label or 'full name' in label: answer = full_name     # What if question is 'name of the city or university you attend, name of referral etc?'
+    elif 'name' in label:
+        if 'full' in label: answer = full_name
+        elif 'first' in label and 'last' not in label: answer = first_name
+        elif 'middle' in label and 'last' not in label: answer = middle_name
+        elif 'last' in label and 'first' not in label: answer = last_name
+        elif 'employer' in label: answer = recent_employer
+        else: answer = full_name
+    elif 'notice' in label:
+        if 'month' in label:
+            answer = notice_period_months
+        elif 'week' in label:
+            answer = notice_period_weeks
+        else: answer = notice_period
+    elif 'salary' in label or 'compensation' in label or 'ctc' in label or 'pay' in label: 
+        if 'current' in label or 'present' in label:
+            if 'month' in label:
+                answer = current_ctc_monthly
+            elif 'lakh' in label:
+                answer = current_ctc_lakhs
+            else:
+                answer = current_ctc
+        else:
+            if 'month' in label:
+                answer = desired_salary_monthly
+            elif 'lakh' in label:
+                answer = desired_salary_lakhs
+            else:
+                answer = desired_salary
+    elif 'linkedin' in label: answer = linkedIn
+    elif 'website' in label or 'blog' in label or 'portfolio' in label or 'link' in label: answer = website
+    elif 'scale of 1-10' in label: answer = confidence_level
+    elif 'headline' in label: answer = linkedin_headline
+    elif ('hear' in label or 'come across' in label) and 'this' in label and ('job' in label or 'position' in label): answer = "https://github.com/GodsScion/Auto_job_applier_linkedIn"
+    elif 'state' in label or 'province' in label: answer = state
+    elif 'zip' in label or 'postal' in label or 'code' in label: answer = zipcode
+    elif 'country' in label: answer = country
+    else: answer = answer_common_questions(label,answer)
+    ##> ------ Yang Li : MARKYangL - Feature ------
+    if answer == "":
+        if use_AI and aiClient:
+            try:
+                if ai_provider.lower() == "openai":
+                    answer = ai_answer_question(aiClient, label_org, question_type="text", job_description=job_description, user_information_all=user_information_all)
+                elif ai_provider.lower() == "deepseek":
+                    answer = deepseek_answer_question(aiClient, label_org, options=None, question_type="text", job_description=job_description, about_company=None, user_information_all=user_information_all)
+                elif ai_provider.lower() == "gemini":
+                    answer = gemini_answer_question(aiClient, label_org, options=None, question_type="text", job_description=job_description, about_company=None, user_information_all=user_information_all)
+                else:
+                    randomly_answered_questions.add((label_org, "text"))
+                    answer = years_of_experience
+                if answer and isinstance(answer, str) and len(answer) > 0:
+                    print_lg(f'AI Answered received for question "{label_org}" \nhere is answer: "{answer}"')
+                else:
+                    randomly_answered_questions.add((label_org, "text"))
+                    answer = years_of_experience
+            except Exception as e:
+                print_lg("Failed to get AI answer!", e)
+                randomly_answered_questions.add((label_org, "text"))
+                answer = years_of_experience
+        else:
+            randomly_answered_questions.add((label_org, "text"))
+            answer = years_of_experience
+    ##<
+    return answer, do_actions
 
 # Function to answer the questions for Easy Apply
 def answer_questions(modal: WebElement, questions_list: set, work_location: str, job_description: str | None = None ) -> set:
@@ -826,76 +995,7 @@ def answer_questions(modal: WebElement, questions_list: set, work_location: str,
 
             prev_answer = text.get_attribute("value")
             if not prev_answer or overwrite_previous_answers:
-                if 'experience' in label or 'years' in label: answer = years_of_experience
-                elif 'phone' in label or 'mobile' in label: answer = phone_number
-                elif 'street' in label: answer = street
-                elif 'city' in label or 'location' in label or 'address' in label:
-                    answer = current_city if current_city else work_location
-                    do_actions = True
-                elif 'signature' in label: answer = full_name # 'signature' in label or 'legal name' in label or 'your name' in label or 'full name' in label: answer = full_name     # What if question is 'name of the city or university you attend, name of referral etc?'
-                elif 'name' in label:
-                    if 'full' in label: answer = full_name
-                    elif 'first' in label and 'last' not in label: answer = first_name
-                    elif 'middle' in label and 'last' not in label: answer = middle_name
-                    elif 'last' in label and 'first' not in label: answer = last_name
-                    elif 'employer' in label: answer = recent_employer
-                    else: answer = full_name
-                elif 'notice' in label:
-                    if 'month' in label:
-                        answer = notice_period_months
-                    elif 'week' in label:
-                        answer = notice_period_weeks
-                    else: answer = notice_period
-                elif 'salary' in label or 'compensation' in label or 'ctc' in label or 'pay' in label: 
-                    if 'current' in label or 'present' in label:
-                        if 'month' in label:
-                            answer = current_ctc_monthly
-                        elif 'lakh' in label:
-                            answer = current_ctc_lakhs
-                        else:
-                            answer = current_ctc
-                    else:
-                        if 'month' in label:
-                            answer = desired_salary_monthly
-                        elif 'lakh' in label:
-                            answer = desired_salary_lakhs
-                        else:
-                            answer = desired_salary
-                elif 'linkedin' in label: answer = linkedIn
-                elif 'website' in label or 'blog' in label or 'portfolio' in label or 'link' in label: answer = website
-                elif 'scale of 1-10' in label: answer = confidence_level
-                elif 'headline' in label: answer = linkedin_headline
-                elif ('hear' in label or 'come across' in label) and 'this' in label and ('job' in label or 'position' in label): answer = "https://github.com/GodsScion/Auto_job_applier_linkedIn"
-                elif 'state' in label or 'province' in label: answer = state
-                elif 'zip' in label or 'postal' in label or 'code' in label: answer = zipcode
-                elif 'country' in label: answer = country
-                else: answer = answer_common_questions(label,answer)
-                ##> ------ Yang Li : MARKYangL - Feature ------
-                if answer == "":
-                    if use_AI and aiClient:
-                        try:
-                            if ai_provider.lower() == "openai":
-                                answer = ai_answer_question(aiClient, label_org, question_type="text", job_description=job_description, user_information_all=user_information_all)
-                            elif ai_provider.lower() == "deepseek":
-                                answer = deepseek_answer_question(aiClient, label_org, options=None, question_type="text", job_description=job_description, about_company=None, user_information_all=user_information_all)
-                            elif ai_provider.lower() == "gemini":
-                                answer = gemini_answer_question(aiClient, label_org, options=None, question_type="text", job_description=job_description, about_company=None, user_information_all=user_information_all)
-                            else:
-                                randomly_answered_questions.add((label_org, "text"))
-                                answer = years_of_experience
-                            if answer and isinstance(answer, str) and len(answer) > 0:
-                                print_lg(f'AI Answered received for question "{label_org}" \nhere is answer: "{answer}"')
-                            else:
-                                randomly_answered_questions.add((label_org, "text"))
-                                answer = years_of_experience
-                        except Exception as e:
-                            print_lg("Failed to get AI answer!", e)
-                            randomly_answered_questions.add((label_org, "text"))
-                            answer = years_of_experience
-                    else:
-                        randomly_answered_questions.add((label_org, "text"))
-                        answer = years_of_experience
-                ##<
+                answer, do_actions = resolve_text_answer(label, label_org, work_location, job_description)
                 text.clear()
                 text.send_keys(answer)
                 if do_actions:
@@ -1124,6 +1224,90 @@ def discard_job() -> None:
 
 
 # Function to apply to jobs
+def easy_apply_new_ui(job_id: str, work_location: str, description: str | None) -> tuple[bool, str, set, object]:
+    '''
+    Function to complete an application in LinkedIn AI search's inline apply flow
+    * The classic Easy Apply modal doesn't exist there: the flow is a 5 page dialog anchored on
+      `#dialog-header`, whose form controls carry React generated ids that change every render,
+      so questions are matched by their text instead
+    * Returns a tuple of (applied, resume, questions_list, date_applied)
+    * Raises on a flow that can't be completed, so the caller logs it as a failed job
+
+    Nothing is ever submitted by the page loop - only the explicit submit step below can do that.
+    '''
+    global pause_before_submit
+    questions_list = set()
+    resume = "Previous resume"
+
+    button = find_linkedin_apply_button(driver)
+    if not button: return False, resume, questions_list, "Pending"
+
+    print_lg("Opening the apply flow...")
+    try: button.click()
+    except Exception: driver.execute_script("arguments[0].click();", button)
+    buffer(click_gap)
+    time.sleep(3)
+
+    dialog = find_apply_dialog(driver)
+    if dialog is None: raise Exception("Clicked Apply but no apply flow opened.")
+
+    for page in range(apply_flow.MAX_PAGES):
+        dialog = find_apply_dialog(driver)
+        if dialog is None: break
+        heading = apply_flow.page_heading(dialog)
+        print_lg(f"Apply flow, {heading}")
+
+        if 'resume' in heading.lower():
+            # The resume page's only controls are one radio per stored resume, whose "question"
+            # is a file name. Feeding those through the question answering picked a resume at
+            # random, so this page is handled on its own.
+            resume = apply_flow.choose_resume(driver, dialog,
+                                              default_resume_path.split('/')[-1] if useNewResume else None)
+        else:
+            for field in apply_flow.read_form(driver, dialog):
+                answered = apply_flow.fill_control(driver, field, work_location,
+                                                   randomly_answered_questions, description)
+                if answered: questions_list.add((answered[0], answered[1], field.get('kind'), ""))
+
+        if apply_flow.submit_button(driver) is not None: break
+
+        advanced, clicked = apply_flow.advance(driver, dialog)
+        if not advanced:
+            # LinkedIn refuses Next while a required answer is missing and leaves the page
+            # looking identical, so without this the loop spins until MAX_PAGES.
+            if pause_at_failed_question:
+                screenshot(driver, job_id, "Needed manual intervention for failed question")
+                pyautogui.alert('Couldn\'t answer one or more questions.\nPlease complete them, then click "Continue".\n\nYou can turn off "Pause at failed question" in config/settings.py',
+                                "Help Needed", "Continue")
+                continue
+            if questions_list: print_lg("Stuck on one of these questions...", questions_list)
+            screenshot(driver, job_id, "Failed at questions")
+            raise Exception(f'Apply flow would not advance past "{heading}" (clicked "{clicked}").')
+
+    submit = apply_flow.submit_button(driver)
+    if submit is None: raise Exception("Never reached the Review page of the apply flow.")
+
+    if questions_list:
+        print_lg("Answered the following questions...", questions_list)
+
+    if pause_before_submit:
+        decision = pyautogui.confirm('1. Please verify your information.\n2. If you edited something, please return to this final screen.\n3. DO NOT CLICK "Submit application".\n\n\nYou can turn off "Pause before submit" in config/settings.py',
+                                     "Confirm your information", ["Disable Pause", "Discard Application", "Submit Application"])
+        if decision == "Discard Application": raise Exception("Job application discarded by user!")
+        pause_before_submit = False if decision == "Disable Pause" else True
+        submit = apply_flow.submit_button(driver) or submit
+
+    try: submit.click()
+    except Exception: driver.execute_script("arguments[0].click();", submit)
+    time.sleep(3)
+    date_applied = datetime.now()
+
+    # Close the confirmation the flow leaves behind, so it can't cover the next job's card
+    if not wait_span_click(driver, "Done", 2): actions.send_keys(Keys.ESCAPE).perform()
+    apply_flow.discard(driver)
+    return True, resume, questions_list, date_applied
+
+
 def apply_to_jobs(search_terms: list[str]) -> None:
     applied_jobs = get_applied_job_ids()
     rejected_jobs = set()
@@ -1164,14 +1348,18 @@ def apply_to_jobs(search_terms: list[str]) -> None:
         current_count = 0
         try:
             while current_count < switch_number:
-                # Wait until job listings are loaded
-                wait.until(EC.presence_of_all_elements_located((By.XPATH, "//li[@data-occludable-job-id]")))
+                # Wait until job listings are loaded. Polls every known markup rather than one
+                # hard coded selector, so a LinkedIn rename falls through to the next candidate
+                # instead of timing out every search with an empty error message.
+                job_listings, matched_selector = wait_for_job_cards(driver)
 
                 pagination_element, current_page = get_page_info()
 
-                # Find all job listings in current page
+                # Re-read the cards: the scroll in get_page_info recycles elements in LinkedIn's
+                # virtualised list, and only the cards near the viewport exist in the DOM.
                 buffer(3)
-                job_listings = driver.find_elements(By.XPATH, "//li[@data-occludable-job-id]")  
+                job_listings = load_all_job_cards(driver, matched_selector)
+                print_lg(f"Found {len(job_listings)} job cards on this page.")
 
             
                 for job in job_listings:
@@ -1306,130 +1494,167 @@ def apply_to_jobs(search_terms: list[str]) -> None:
                     if soft_block_active(): handle_soft_block()
                     pacer.wait_for_slot()
 
-                    # Case 1: Easy Apply Button
-                    # The aria-label reads "LinkedIn Apply to <job title>" - it does not contain
-                    # the word "Easy", so matching on that missed every Easy Apply job.
-                    is_easy_apply = try_xp(driver, ".//button[contains(@class,'jobs-apply-button') and (contains(@aria-label, 'Easy') or contains(@aria-label, 'LinkedIn Apply') or normalize-space()='Easy Apply')]")
-                    # Fallback 1: check if apply link contains Easy Apply URL pattern
-                    if not is_easy_apply:
+                    # Case 0: LinkedIn's AI search - a different apply flow entirely, so it is
+                    # handled before any of the classic detection below is attempted.
+                    if is_new_ui(driver):
                         try:
-                            apply_link_el = driver.find_element(By.XPATH, ".//a[contains(@href, 'openSDUIApplyFlow=true')]")
-                            if apply_link_el:
-                                apply_link_el.click()
-                                is_easy_apply = True
-                                print_lg("Detected Easy Apply via URL pattern (openSDUIApplyFlow)")
-                        except:
-                            pass
-                    # Fallback 2: click any Apply button and check if Easy Apply modal appears
-                    if not is_easy_apply:
-                        try:
-                            apply_btn = driver.find_element(By.XPATH, ".//button[contains(@class,'jobs-apply-button')]")
-                            if apply_btn:
-                                tabs_before = len(driver.window_handles)
-                                apply_btn.click()
-                                buffer(click_gap)
-                                tabs_after = len(driver.window_handles)
-                                if tabs_after > tabs_before:
-                                    # New tab opened — external apply, capture the employer's link before going back
-                                    external_link = capture_external_link(tabs_before)
-                                    print_lg('External apply detected via new tab, got the application link "{}"'.format(external_link))
-                                else:
-                                    try:
-                                        find_by_class(driver, "jobs-easy-apply-modal")
-                                        is_easy_apply = True
-                                        print_lg("Detected Easy Apply via modal appearance after click")
-                                    except:
-                                        # Modal didn't appear — dismiss
-                                        try: actions.send_keys(Keys.ESCAPE).perform()
-                                        except: pass
-                        except:
-                            pass
-                    if is_easy_apply:
-                        try: 
-                            try:
-                                errored = ""
-                                modal = find_by_class(driver, "jobs-easy-apply-modal")
-                                wait_span_click(modal, "Next", 1)
-                                # if description != "Unknown":
-                                #     resume = create_custom_resume(description)
-                                resume = "Previous resume"
-                                next_button = True
-                                questions_list = set()
-                                next_counter = 0
-                                while next_button:
-                                    next_counter += 1
-                                    if next_counter >= 15: 
-                                        if pause_at_failed_question:
-                                            screenshot(driver, job_id, "Needed manual intervention for failed question")
-                                            pyautogui.alert("Couldn't answer one or more questions.\nPlease click \"Continue\" once done.\nDO NOT CLICK Back, Next or Review button in LinkedIn.\n\n\n\n\nYou can turn off \"Pause at failed question\" setting in config.py", "Help Needed", "Continue")
-                                            next_counter = 1
-                                            continue
-                                        if questions_list: print_lg("Stuck for one or some of the following questions...", questions_list)
-                                        screenshot_name = screenshot(driver, job_id, "Failed at questions")
-                                        errored = "stuck"
-                                        raise Exception("Seems like stuck in a continuous loop of next, probably because of new questions.")
-                                    questions_list = answer_questions(modal, questions_list, work_location, job_description=description)
-                                    if useNewResume and not uploaded: uploaded, resume = upload_resume(modal, default_resume_path)
-                                    try: next_button = modal.find_element(By.XPATH, './/span[normalize-space(.)="Review"]') 
-                                    except NoSuchElementException:  next_button = modal.find_element(By.XPATH, './/button[contains(span, "Next")]')
-                                    try: next_button.click()
-                                    except ElementClickInterceptedException: break    # Happens when it tries to click Next button in About Company photos section
-                                    buffer(click_gap)
-
-                            except NoSuchElementException: errored = "nose"
-                            finally:
-                                if questions_list and errored != "stuck": 
-                                    print_lg("Answered the following questions...", questions_list)
-                                    print("\n\n" + "\n".join(str(question) for question in questions_list) + "\n\n")
-                                wait_span_click(driver, "Review", 1, scrollTop=True)
-                                cur_pause_before_submit = pause_before_submit
-                                if errored != "stuck" and cur_pause_before_submit:
-                                    decision = pyautogui.confirm('1. Please verify your information.\n2. If you edited something, please return to this final screen.\n3. DO NOT CLICK "Submit Application".\n\n\n\n\nYou can turn off "Pause before submit" setting in config.py\nTo TEMPORARILY disable pausing, click "Disable Pause"', "Confirm your information",["Disable Pause", "Discard Application", "Submit Application"])
-                                    if decision == "Discard Application": raise Exception("Job application discarded by user!")
-                                    pause_before_submit = False if "Disable Pause" == decision else True
-                                    # try_xp(modal, ".//span[normalize-space(.)='Review']")
-                                follow_company(modal)
-                                if wait_span_click(driver, "Submit application", 2, scrollTop=True): 
-                                    date_applied = datetime.now()
-                                    if not wait_span_click(driver, "Done", 2): actions.send_keys(Keys.ESCAPE).perform()
-                                elif errored != "stuck" and cur_pause_before_submit and "Yes" in pyautogui.confirm("You submitted the application, didn't you 😒?", "Failed to find Submit Application!", ["Yes", "No"]):
-                                    date_applied = datetime.now()
-                                    wait_span_click(driver, "Done", 2)
-                                else:
-                                    print_lg("Since, Submit Application failed, discarding the job application...")
-                                    # if screenshot_name == "Not Available":  screenshot_name = screenshot(driver, job_id, "Failed to click Submit application")
-                                    # else:   screenshot_name = [screenshot_name, screenshot(driver, job_id, "Failed to click Submit application")]
-                                    if errored == "nose": raise Exception("Failed to click Submit application 😑")
-
-
+                            applied, resume, questions_list, new_date = easy_apply_new_ui(job_id, work_location, description)
                         except Exception as e:
-                            print_lg("Failed to Easy apply!")
-                            # print_lg(e)
-                            # The rate-limit pause surfaces as an ordinary Easy Apply failure, so
-                            # check for it here before writing the job off as failed.
+                            print_lg("Failed to apply through the new apply flow!")
                             if soft_block_active():
-                                discard_job()
+                                apply_flow.discard(driver)
                                 handle_soft_block()
                                 continue
-                            critical_error_log("Somewhere in Easy Apply process",e)
-                            failed_job(job_id, job_link, resume, date_listed, "Problem in Easy Applying", e, application_link, screenshot_name)
+                            critical_error_log("In new UI apply flow", e)
+                            failed_job(job_id, job_link, resume, date_listed, "Problem in new apply flow", e, application_link, screenshot_name)
                             failed_count += 1
-                            discard_job()
+                            apply_flow.discard(driver)
                             continue
-                    elif external_link:
-                        # Case 2a: Apply button already opened the employer's site above, just record the link
-                        if not collect_external_links:
-                            print_lg("Skipping this external job, `collect_external_links` is turned off!")
-                            skip_count += 1
-                            continue
-                        application_link = external_link
+                        if applied:
+                            date_applied = new_date
+                        else:
+                            # No on-LinkedIn apply button, so this job applies on the employer's site
+                            if not collect_external_links:
+                                print_lg("Skipping this external job, `collect_external_links` is turned off!")
+                                skip_count += 1
+                                continue
+                            external_button = find_external_apply_button(driver)
+                            if external_button:
+                                tabs_before = len(driver.window_handles)
+                                try: external_button.click()
+                                except Exception: driver.execute_script("arguments[0].click();", external_button)
+                                buffer(click_gap)
+                                application_link = capture_external_link(tabs_before) or "Unknown"
+                                print_lg(f'External apply, got the application link "{application_link}"')
+                            else:
+                                print_lg("No apply button of either kind on this job, skipping it.")
+                                skip_count += 1
+                                continue
                     else:
-                        # Case 2b: Apply externally
-                        skip, application_link, tabs_count = external_apply(pagination_element, job_id, job_link, resume, date_listed, application_link, screenshot_name)
-                        if dailyEasyApplyLimitReached:
-                            print_lg("\n###############  Daily application limit for Easy Apply is reached!  ###############\n")
-                            return
-                        if skip: continue
+                        # Case 1: Easy Apply Button
+                        # The aria-label reads "LinkedIn Apply to <job title>" - it does not
+                        # contain the word "Easy", so matching on that missed every Easy Apply job.
+                        is_easy_apply = try_xp(driver, ".//button[contains(@class,'jobs-apply-button') and (contains(@aria-label, 'Easy') or contains(@aria-label, 'LinkedIn Apply') or normalize-space()='Easy Apply')]")
+                        # Fallback 1: check if apply link contains Easy Apply URL pattern
+                        if not is_easy_apply:
+                            try:
+                                apply_link_el = driver.find_element(By.XPATH, ".//a[contains(@href, 'openSDUIApplyFlow=true')]")
+                                if apply_link_el:
+                                    apply_link_el.click()
+                                    is_easy_apply = True
+                                    print_lg("Detected Easy Apply via URL pattern (openSDUIApplyFlow)")
+                            except:
+                                pass
+                        # Fallback 2: click any Apply button and check if Easy Apply modal appears
+                        if not is_easy_apply:
+                            try:
+                                apply_btn = driver.find_element(By.XPATH, ".//button[contains(@class,'jobs-apply-button')]")
+                                if apply_btn:
+                                    tabs_before = len(driver.window_handles)
+                                    apply_btn.click()
+                                    buffer(click_gap)
+                                    tabs_after = len(driver.window_handles)
+                                    if tabs_after > tabs_before:
+                                        # New tab opened — external apply, capture the employer's link before going back
+                                        external_link = capture_external_link(tabs_before)
+                                        print_lg('External apply detected via new tab, got the application link "{}"'.format(external_link))
+                                    else:
+                                        try:
+                                            find_by_class(driver, "jobs-easy-apply-modal")
+                                            is_easy_apply = True
+                                            print_lg("Detected Easy Apply via modal appearance after click")
+                                        except:
+                                            # Modal didn't appear — dismiss
+                                            try: actions.send_keys(Keys.ESCAPE).perform()
+                                            except: pass
+                            except:
+                                pass
+                        if is_easy_apply:
+                            try: 
+                                try:
+                                    errored = ""
+                                    modal = find_by_class(driver, "jobs-easy-apply-modal")
+                                    wait_span_click(modal, "Next", 1)
+                                    # if description != "Unknown":
+                                    #     resume = create_custom_resume(description)
+                                    resume = "Previous resume"
+                                    next_button = True
+                                    questions_list = set()
+                                    next_counter = 0
+                                    while next_button:
+                                        next_counter += 1
+                                        if next_counter >= 15: 
+                                            if pause_at_failed_question:
+                                                screenshot(driver, job_id, "Needed manual intervention for failed question")
+                                                pyautogui.alert("Couldn't answer one or more questions.\nPlease click \"Continue\" once done.\nDO NOT CLICK Back, Next or Review button in LinkedIn.\n\n\n\n\nYou can turn off \"Pause at failed question\" setting in config.py", "Help Needed", "Continue")
+                                                next_counter = 1
+                                                continue
+                                            if questions_list: print_lg("Stuck for one or some of the following questions...", questions_list)
+                                            screenshot_name = screenshot(driver, job_id, "Failed at questions")
+                                            errored = "stuck"
+                                            raise Exception("Seems like stuck in a continuous loop of next, probably because of new questions.")
+                                        questions_list = answer_questions(modal, questions_list, work_location, job_description=description)
+                                        if useNewResume and not uploaded: uploaded, resume = upload_resume(modal, default_resume_path)
+                                        try: next_button = modal.find_element(By.XPATH, './/span[normalize-space(.)="Review"]') 
+                                        except NoSuchElementException:  next_button = modal.find_element(By.XPATH, './/button[contains(span, "Next")]')
+                                        try: next_button.click()
+                                        except ElementClickInterceptedException: break    # Happens when it tries to click Next button in About Company photos section
+                                        buffer(click_gap)
+
+                                except NoSuchElementException: errored = "nose"
+                                finally:
+                                    if questions_list and errored != "stuck": 
+                                        print_lg("Answered the following questions...", questions_list)
+                                        print("\n\n" + "\n".join(str(question) for question in questions_list) + "\n\n")
+                                    wait_span_click(driver, "Review", 1, scrollTop=True)
+                                    cur_pause_before_submit = pause_before_submit
+                                    if errored != "stuck" and cur_pause_before_submit:
+                                        decision = pyautogui.confirm('1. Please verify your information.\n2. If you edited something, please return to this final screen.\n3. DO NOT CLICK "Submit Application".\n\n\n\n\nYou can turn off "Pause before submit" setting in config.py\nTo TEMPORARILY disable pausing, click "Disable Pause"', "Confirm your information",["Disable Pause", "Discard Application", "Submit Application"])
+                                        if decision == "Discard Application": raise Exception("Job application discarded by user!")
+                                        pause_before_submit = False if "Disable Pause" == decision else True
+                                        # try_xp(modal, ".//span[normalize-space(.)='Review']")
+                                    follow_company(modal)
+                                    if wait_span_click(driver, "Submit application", 2, scrollTop=True): 
+                                        date_applied = datetime.now()
+                                        if not wait_span_click(driver, "Done", 2): actions.send_keys(Keys.ESCAPE).perform()
+                                    elif errored != "stuck" and cur_pause_before_submit and "Yes" in pyautogui.confirm("You submitted the application, didn't you 😒?", "Failed to find Submit Application!", ["Yes", "No"]):
+                                        date_applied = datetime.now()
+                                        wait_span_click(driver, "Done", 2)
+                                    else:
+                                        print_lg("Since, Submit Application failed, discarding the job application...")
+                                        # if screenshot_name == "Not Available":  screenshot_name = screenshot(driver, job_id, "Failed to click Submit application")
+                                        # else:   screenshot_name = [screenshot_name, screenshot(driver, job_id, "Failed to click Submit application")]
+                                        if errored == "nose": raise Exception("Failed to click Submit application 😑")
+
+
+                            except Exception as e:
+                                print_lg("Failed to Easy apply!")
+                                # print_lg(e)
+                                # The rate-limit pause surfaces as an ordinary Easy Apply failure, so
+                                # check for it here before writing the job off as failed.
+                                if soft_block_active():
+                                    discard_job()
+                                    handle_soft_block()
+                                    continue
+                                critical_error_log("Somewhere in Easy Apply process",e)
+                                failed_job(job_id, job_link, resume, date_listed, "Problem in Easy Applying", e, application_link, screenshot_name)
+                                failed_count += 1
+                                discard_job()
+                                continue
+                        elif external_link:
+                            # Case 2a: Apply button already opened the employer's site above, just record the link
+                            if not collect_external_links:
+                                print_lg("Skipping this external job, `collect_external_links` is turned off!")
+                                skip_count += 1
+                                continue
+                            application_link = external_link
+                        else:
+                            # Case 2b: Apply externally
+                            skip, application_link, tabs_count = external_apply(pagination_element, job_id, job_link, resume, date_listed, application_link, screenshot_name)
+                            if dailyEasyApplyLimitReached:
+                                print_lg("\n###############  Daily application limit for Easy Apply is reached!  ###############\n")
+                                return
+                            if skip: continue
 
                     submitted_jobs(job_id, title, company, work_location, work_style, description, experience_required, skills, hr_name, hr_link, resume, reposted, date_listed, date_applied, job_link, application_link, questions_list, connect_request)
                     if uploaded:   useNewResume = False
@@ -1445,6 +1670,15 @@ def apply_to_jobs(search_terms: list[str]) -> None:
 
 
                 # Switching to next page
+                # The AI search has no artdeco pagination bar at all, so `pagination_element`
+                # is always None there and every search used to stop after its first page.
+                if is_new_ui(driver):
+                    dismiss_modal_overlay()
+                    if not go_to_next_page(driver):
+                        print_lg("\n>-> No next page button. At the end of the results!\n")
+                        break
+                    print_lg("\n>-> Now on the next page \n")
+                    continue
                 if pagination_element == None:
                     print_lg("Couldn't find pagination element, probably at the end page of results!")
                     break
@@ -1476,6 +1710,13 @@ def apply_to_jobs(search_terms: list[str]) -> None:
             print_lg(f"\n{'='*70}\n{e}\nStopping the run - remaining searches would all be blocked.\n"
                      f"Applications reset after about 24 hours.\n{'='*70}\n")
             break
+        except TimeoutException as e:
+            # TimeoutException subclasses WebDriverException, so it used to be swallowed by the
+            # handler below and logged as a bare "Message:" with nothing after it. The page state
+            # is what actually says whether this is a rename, a logout or an empty search.
+            log_no_job_cards(searchTerm, current_search_location)
+            critical_error_log("In Applier - no job listings", e)
+            continue
         except (NoSuchWindowException, WebDriverException) as e:
             # ElementClickInterceptedException & friends are WebDriverException subclasses, so
             # confirm the session is actually dead before writing off the whole run.
