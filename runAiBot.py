@@ -1360,6 +1360,11 @@ def apply_to_jobs(search_terms: list[str]) -> None:
             continue
 
         current_count = 0
+        # Applying on the AI search navigates away to /jobs/view/<id>/, so the results list has
+        # to be reloaded afterwards - which invalidates every card element the loop below holds.
+        # These ids remember what this search already handled, so reloading cannot re-process
+        # the same job (or spin forever on one that fails).
+        processed_ids = set()
         try:
             while current_count < switch_number:
                 # Wait until job listings are loaded. Polls every known markup rather than one
@@ -1376,13 +1381,18 @@ def apply_to_jobs(search_terms: list[str]) -> None:
                 print_lg(f"Found {len(job_listings)} job cards on this page.")
 
             
+                reload_results = False
                 for job in job_listings:
                     if keep_screen_awake: pyautogui.press('shiftright')
                     if current_count >= switch_number: break
+                    # Cheap id read first, so a job this search already handled is skipped
+                    # before anything is clicked
+                    if extract_job_id(job) in processed_ids: continue
                     print_lg("\n-@-\n")
 
                     try:
                         job_id,title,company,work_location,work_style,skip = get_job_main_details(job, blacklisted_companies, rejected_jobs)
+                        processed_ids.add(job_id)
                     except (NoSuchWindowException, InvalidSessionIdException):
                         raise   # Browser is genuinely gone, let the outer handler end the run
                     except Exception as e:
@@ -1523,6 +1533,11 @@ def apply_to_jobs(search_terms: list[str]) -> None:
                             failed_job(job_id, job_link, resume, date_listed, "Problem in new apply flow", e, application_link, screenshot_name)
                             failed_count += 1
                             apply_flow.discard(driver)
+                            # A failed apply leaves us on /jobs/view/ just as a successful one
+                            # does, so the remaining cards are stale here too.
+                            if "/jobs/view/" in driver.current_url:
+                                reload_results = True
+                                break
                             continue
                         if applied:
                             date_applied = new_date
@@ -1681,7 +1696,25 @@ def apply_to_jobs(search_terms: list[str]) -> None:
                     else:   external_jobs_count += 1
                     applied_jobs.add(job_id)
 
+                    # Applying navigated off the results list, so every remaining card in
+                    # `job_listings` now points at a detached element. Reload and start the page
+                    # again rather than clicking corpses. Checked against the landed URL rather
+                    # than is_new_ui(), which reports False precisely because we have left.
+                    if "/jobs/view/" in driver.current_url:
+                        reload_results = True
+                        break
 
+
+
+                # Back to the results list after an apply took us to /jobs/view/. Without this
+                # only the first job of each search could ever be opened - every later card was
+                # a stale element on the wrong page ("Unknown | Unknown", not interactable).
+                if reload_results:
+                    print_lg("Returning to the results list after applying.")
+                    apply_flow.discard(driver)
+                    driver.get(search_url)
+                    buffer(3)
+                    continue
 
                 # Switching to next page
                 # The AI search has no artdeco pagination bar at all, so `pagination_element`
