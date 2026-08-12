@@ -672,6 +672,7 @@ def extract_years_of_experience(text: str) -> int:
 
 
 def get_job_description(
+    job_id: str | None = None
 ) -> tuple[
     str | Literal['Unknown'],
     int | Literal['Unknown'],
@@ -689,17 +690,24 @@ def get_job_description(
     - `skipReason: str | None`
     - `skipMessage: str | None`
     '''
+    ##> ------ Dheeraj Deshwal : dheeraj9811 Email:dheeraj20194@iiitd.ac.in/dheerajdeshwal9811@gmail.com - Feature ------
+    jobDescription = "Unknown"
+    ##<
+    experience_required = "Unknown"
+    found_masters = 0
+    # Initialised before the extraction below, not after it. The `finally` block returns these
+    # unconditionally, so leaving them until after a call that can throw made a failed
+    # extraction raise "cannot access local variable 'skip'" and abandon the whole search.
+    skip = False
+    skipReason = None
+    skipMessage = None
     try:
-        ##> ------ Dheeraj Deshwal : dheeraj9811 Email:dheeraj20194@iiitd.ac.in/dheerajdeshwal9811@gmail.com - Feature ------
-        jobDescription = "Unknown"
-        ##<
-        experience_required = "Unknown"
-        found_masters = 0
-        jobDescription = find_by_class(driver, "jobs-box__html-content").text
+        # LinkedIn's AI search has no `.jobs-box__html-content`; the description lives in an
+        # element keyed by job id. Without this every job on the new UI failed to extract.
+        jobDescription = job_description_text(driver, job_id) if job_id else ""
+        if not jobDescription:
+            jobDescription = find_by_class(driver, "jobs-box__html-content").text
         jobDescriptionLow = jobDescription.lower()
-        skip = False
-        skipReason = None
-        skipMessage = None
         for word in bad_words:
             # Whole word/phrase match, so "Intern" doesn't skip a job that merely says "internal"
             if re.search(r'\b' + re.escape(word.lower()) + r'\b', jobDescriptionLow):
@@ -1452,7 +1460,7 @@ def apply_to_jobs(search_terms: list[str]) -> None:
                         print_lg("Failed to calculate the date posted!",e)
 
 
-                    description, experience_required, skip, reason, message = get_job_description()
+                    description, experience_required, skip, reason, message = get_job_description(job_id)
                     if skip:
                         print_lg(message)
                         failed_job(job_id, job_link, resume, date_listed, reason, message, "Skipped", screenshot_name)
@@ -1733,8 +1741,14 @@ def apply_to_jobs(search_terms: list[str]) -> None:
         except Exception as e:
             print_lg("Failed to find Job listings!")
             critical_error_log("In Applier", e)
+            # The page source used to go straight into log.txt, which buried every real message
+            # under megabytes of LinkedIn markup (the log had grown to 3.8 MB). It is still
+            # written for debugging, just to its own file, with only the path logged here.
             try:
-                print_lg(driver.page_source, pretty=True)
+                dump_path = f"{logs_folder_path}/page_source_{datetime.now():%Y%m%d_%H%M%S}.html"
+                with open(dump_path, 'w', encoding='utf-8') as dump_file:
+                    dump_file.write(driver.page_source)
+                print_lg(f"Saved the page source that failed to: {dump_path}")
             except Exception as page_source_error:
                 print_lg(f"Failed to get page source, browser might have crashed. {page_source_error}")
             # print_lg(e)
