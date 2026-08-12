@@ -1256,11 +1256,12 @@ def easy_apply_new_ui(job_id: str, work_location: str, description: str | None) 
     buffer(click_gap)
     time.sleep(3)
 
-    dialog = find_apply_dialog(driver)
+    dialog = apply_flow.wait_until_ready(driver)
     if dialog is None: raise Exception("Clicked Apply but no apply flow opened.")
 
     for page in range(apply_flow.MAX_PAGES):
-        dialog = find_apply_dialog(driver)
+        # Wait for each page to render before reading it, not just the first
+        dialog = apply_flow.wait_until_ready(driver)
         if dialog is None: break
         heading = apply_flow.page_heading(dialog)
         print_lg(f"Apply flow, {heading}")

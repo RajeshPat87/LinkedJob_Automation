@@ -127,6 +127,31 @@ def read_form(driver: WebDriver, dialog: WebElement) -> list[dict]:
         return []
 
 
+def wait_until_ready(driver: WebDriver, timeout: int = 20) -> WebElement | None:
+    '''
+    Function to wait until the apply flow's current page has actually rendered
+    * Returns the dialog root once it shows its "N/M pages" indicator and holds a control or a
+      step button, or `None` if it never does
+    * The dialog element exists before its contents do. Reading it too early returns no fields,
+      so nothing gets answered and LinkedIn then refuses Next on a page whose required
+      questions were never seen - which looks exactly like an unanswerable question.
+    '''
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        dialog = find_apply_dialog(driver)
+        if dialog is not None:
+            try:
+                text = dialog.text or ""
+                ready = re.search(r"\d+/\d+ pages", text) and (
+                    dialog.find_elements(By.XPATH, ".//input | .//select | .//textarea")
+                    or find_step_button(dialog, "Next", "Review", "Submit application"))
+                if ready: return dialog
+            except Exception:
+                pass
+        time.sleep(1)
+    return find_apply_dialog(driver)
+
+
 def page_heading(dialog: WebElement) -> str:
     '''
     Function to read which page of the apply flow is open, e.g. "2/5 pages - Resume"
@@ -318,11 +343,16 @@ def advance(driver: WebDriver, dialog: WebElement) -> tuple[bool, str]:
     except Exception as e:
         print_lg("Couldn't click the apply flow's next button.", e)
         return False, label
-    time.sleep(3)
-    after = apply_progress(driver)
-    # Review keeps progress at 100, so treat reaching the submit page as advancing too
-    if after is not None and before is not None and after > before: return True, label
-    return submit_button(driver) is not None, label
+    # Poll rather than read once: a page that simply took longer than a fixed sleep to render
+    # was being reported as "the form refused Next", which discarded a perfectly good
+    # application. Review keeps progress at 100, so reaching the submit page counts as advancing.
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        time.sleep(1)
+        if submit_button(driver) is not None: return True, label
+        after = apply_progress(driver)
+        if after is not None and before is not None and after > before: return True, label
+    return False, label
 
 
 def submit_button(driver: WebDriver) -> WebElement | None:
