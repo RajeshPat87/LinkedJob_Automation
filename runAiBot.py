@@ -39,6 +39,7 @@ from selenium.common.exceptions import NoSuchElementException, ElementClickInter
 from modules import apply_flow
 from modules.linkedin_ui import (about_company_text, extract_job_id, find_apply_dialog,
                                  find_external_apply_button, find_linkedin_apply_button,
+                                 find_modal_step_button, find_step_button, pick_phone_country_option,
                                  go_to_next_page, is_new_ui, is_new_ui_card, job_description_text,
                                  load_all_job_cards, parse_new_ui_card, resolve_geo_id,
                                  wait_for_job_cards, NO_RESULTS_MARKERS)
@@ -844,6 +845,19 @@ def resolve_text_answer(label: str, label_org: str, work_location: str,
     ##<
     return answer, do_actions
 
+##> ------ Local fix : Submit button whose text isn't in a direct <span> ------
+def click_submit_button(modal: WebElement) -> bool:
+    '''
+    Fallback for when the "Submit application" span can't be found: matches the button by its
+    whole visible text. Only called after the pause-before-submit confirmation.
+    '''
+    button = find_step_button(modal, "Submit application")
+    if button is None: return False
+    button.click()
+    buffer(click_gap)
+    return True
+##<
+
 # Function to answer the questions for Easy Apply
 def answer_questions(modal: WebElement, questions_list: set, work_location: str, job_description: str | None = None ) -> set:
     # Get all questions from the page
@@ -873,6 +887,20 @@ def answer_questions(modal: WebElement, questions_list: set, work_location: str,
                 optionsText = [option.text for option in select.options]
                 options = "".join([f' "{option}",' for option in optionsText])
             prev_answer = selected_option
+            ##> ------ Local fix : Phone country code must match the phone number ------
+            # LinkedIn now preselects the first entry ("Andorra (+376)") instead of leaving the
+            # dropdown on "Select an option", so the old "keep what's there" rule kept a wrong code.
+            # The phone number in personals.py belongs to `country`, so always pick that entry.
+            if label == "phone country code":
+                answer = pick_phone_country_option([option.text for option in select.options], country)
+                if answer is None:
+                    print_lg(f'Couldn\'t find "{country}" in the phone country codes, keeping "{prev_answer}"')
+                    answer = prev_answer
+                elif answer != prev_answer:
+                    select.select_by_visible_text(answer)
+                questions_list.add((f'{label_org} [ {options} ]', answer, "select", prev_answer))
+                continue
+            ##<
             if overwrite_previous_answers or selected_option == "Select an option":
                 ##> ------ WINDY_WINDWARD Email:karthik.sarode23@gmail.com - Added fuzzy logic to answer location based questions ------
                 if 'email' in label or 'phone' in label: 
@@ -1603,7 +1631,11 @@ def apply_to_jobs(search_terms: list[str]) -> None:
                                 try:
                                     errored = ""
                                     modal = find_by_class(driver, "jobs-easy-apply-modal")
-                                    wait_span_click(modal, "Next", 1)
+                                    ##> ------ Local fix : Answer the contact page instead of skipping it ------
+                                    # The first page used to be skipped with a blind "Next" click, which left
+                                    # its preselected phone country code unchecked. The loop below answers
+                                    # every page, this one included, before moving on.
+                                    ##<
                                     # if description != "Unknown":
                                     #     resume = create_custom_resume(description)
                                     resume = "Previous resume"
@@ -1624,8 +1656,10 @@ def apply_to_jobs(search_terms: list[str]) -> None:
                                             raise Exception("Seems like stuck in a continuous loop of next, probably because of new questions.")
                                         questions_list = answer_questions(modal, questions_list, work_location, job_description=description)
                                         if useNewResume and not uploaded: uploaded, resume = upload_resume(modal, default_resume_path)
-                                        try: next_button = modal.find_element(By.XPATH, './/span[normalize-space(.)="Review"]') 
-                                        except NoSuchElementException:  next_button = modal.find_element(By.XPATH, './/button[contains(span, "Next")]')
+                                        ##> ------ Local fix : Find Next/Review by the button's text, not its inner span ------
+                                        next_button = find_modal_step_button(modal, 3)
+                                        if next_button is None: raise NoSuchElementException("No Next or Review button in the Easy Apply modal")
+                                        ##<
                                         try: next_button.click()
                                         except ElementClickInterceptedException: break    # Happens when it tries to click Next button in About Company photos section
                                         buffer(click_gap)
@@ -1635,15 +1669,20 @@ def apply_to_jobs(search_terms: list[str]) -> None:
                                     if questions_list and errored != "stuck": 
                                         print_lg("Answered the following questions...", questions_list)
                                         print("\n\n" + "\n".join(str(question) for question in questions_list) + "\n\n")
-                                    wait_span_click(driver, "Review", 1, scrollTop=True)
+                                    review_button = find_step_button(modal, "Review")
+                                    if review_button is not None:
+                                        review_button.click()
+                                        buffer(click_gap)
                                     cur_pause_before_submit = pause_before_submit
                                     if errored != "stuck" and cur_pause_before_submit:
                                         decision = pyautogui.confirm('1. Please verify your information.\n2. If you edited something, please return to this final screen.\n3. DO NOT CLICK "Submit Application".\n\n\n\n\nYou can turn off "Pause before submit" setting in config.py\nTo TEMPORARILY disable pausing, click "Disable Pause"', "Confirm your information",["Disable Pause", "Discard Application", "Submit Application"])
-                                        if decision == "Discard Application": raise Exception("Job application discarded by user!")
+                                        # Fail closed, like easy_apply_new_ui(): only an explicit approval may submit
+                                        if decision not in ("Submit Application", "Disable Pause"):
+                                            raise Exception(f'Submit was not confirmed (the dialog returned {decision!r}), discarding this application instead of sending it.')
                                         pause_before_submit = False if "Disable Pause" == decision else True
                                         # try_xp(modal, ".//span[normalize-space(.)='Review']")
                                     follow_company(modal)
-                                    if wait_span_click(driver, "Submit application", 2, scrollTop=True): 
+                                    if wait_span_click(driver, "Submit application", 2, scrollTop=True) or click_submit_button(modal): 
                                         date_applied = datetime.now()
                                         if not wait_span_click(driver, "Done", 2): actions.send_keys(Keys.ESCAPE).perform()
                                     elif errored != "stuck" and cur_pause_before_submit and "Yes" in pyautogui.confirm("You submitted the application, didn't you 😒?", "Failed to find Submit Application!", ["Yes", "No"]):

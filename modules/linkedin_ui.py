@@ -400,3 +400,56 @@ def find_step_button(dialog: WebElement, *labels: str) -> WebElement | None:
         except Exception:
             continue
     return None
+
+
+##> ------ Classic Easy Apply modal ------
+
+# aria-labels LinkedIn puts on the modal's step buttons, used when a button has no visible text
+STEP_BUTTON_ARIA_LABELS = {
+    "review": ("review your application",),
+    "next": ("continue to next step",),
+}
+
+
+def _step_button_by_aria_label(modal: WebElement, label: str) -> WebElement | None:
+    for button in modal.find_elements(By.XPATH, ".//button[@aria-label]"):
+        try:
+            if not button.is_displayed(): continue
+            aria_label = (button.get_attribute("aria-label") or "").strip().lower()
+            if aria_label in STEP_BUTTON_ARIA_LABELS[label]: return button
+        except Exception:
+            continue
+    return None
+
+
+def find_modal_step_button(modal: WebElement, timeout: float = 3.0) -> WebElement | None:
+    '''
+    Function to find the classic Easy Apply modal's "Review" or "Next" button
+    * Prefers "Review" (the last page before submitting) over "Next"/"Continue"
+    * Matches the button's whole visible text, so it no longer depends on the text sitting in a
+      direct child `<span>`, and falls back to the button's aria-label
+    * Never returns "Submit application"; waits up to `timeout` seconds for the page to render
+    '''
+    deadline = time.time() + timeout
+    while True:
+        for label, texts in (("review", ("Review",)), ("next", ("Next", "Continue"))):
+            button = find_step_button(modal, *texts) or _step_button_by_aria_label(modal, label)
+            if button is not None: return button
+        if time.time() >= deadline: return None
+        time.sleep(0.5)
+
+
+def pick_phone_country_option(options: list[str], country: str) -> str | None:
+    '''
+    Function to pick the "Phone country code" dropdown entry for `country`
+    * Options read like "India (+91)"; matched on the full country name so "India" never picks
+      "British Indian Ocean Territory (+246)"
+    * Returns `None` when `country` is empty or not in the list
+    '''
+    wanted = (country or "").strip().lower()
+    if not wanted: return None
+    for option in options:
+        name = option.split("(")[0].strip().lower()
+        if name == wanted: return option
+    return None
+##<
