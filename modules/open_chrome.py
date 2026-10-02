@@ -94,7 +94,17 @@ def createChromeSession(isRetry: bool = False):
             driver = uc.Chrome(options=options, version_main=get_installed_chrome_major_version())
 ##<
     else: driver = webdriver.Chrome(options=options) #, service=Service(executable_path="C:\\Program Files\\Google\\Chrome\\chromedriver-win64\\chromedriver.exe"))
-    driver.maximize_window()
+##> ------ Local fix : Maximizing is cosmetic, never let it abort the run ------
+    # ChromeDriver 154 under WSLg fails `maximize_window()` with "JavaScript code failed ...
+    # 'Runtime.evaluate' wasn't found" even though the session itself is healthy. The window
+    # already opens maximized via --start-maximized, so fall back to a fixed size and carry on.
+    try:
+        driver.maximize_window()
+    except Exception as e:
+        print_lg("Couldn't maximize the Chrome window ({}), using a fixed 1920x1080 size instead.".format(str(e).splitlines()[0]))
+        try: driver.set_window_size(1920, 1080)
+        except Exception as size_error: print_lg("Ignoring '{}' while resizing the Chrome window.".format(str(size_error).splitlines()[0]))
+##<
     wait = WebDriverWait(driver, 5)
     actions = ActionChains(driver)
     return options, driver, actions, wait
@@ -112,6 +122,16 @@ except Exception as e:
     critical_error_log("In Opening Chrome", e)
     from pyautogui import alert
     alert(msg, "Error in opening chrome")
-    try: driver.quit()
-    except NameError: exit()
+##> ------ Local fix : Don't let the cleanup hide the real error ------
+    # `driver` is still None whenever createChromeSession() failed before it built one, so the old
+    # `driver.quit()` raised AttributeError right here and buried the actual reason Chrome wouldn't
+    # open under a "During handling of the above exception, another exception occurred" traceback.
+    # `except NameError` never caught that, and it also meant a successful quit fell through and let
+    # the rest of the bot run against driver = None. Close whatever exists, swallow any failure doing
+    # so, and always exit so the logged cause above is the last thing reported.
+    if driver is not None:
+        try: driver.quit()
+        except Exception as quit_error: print_lg("Ignoring '{}' while closing the failed Chrome session.".format(quit_error))
+    exit()
+##<
     
