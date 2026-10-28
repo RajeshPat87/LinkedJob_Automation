@@ -23,6 +23,7 @@ from selenium.webdriver.remote.webdriver import WebDriver
 from selenium.webdriver.remote.webelement import WebElement
 from selenium.webdriver.support.select import Select
 
+from modules.form_values import fit_to_validation, replace_text
 from modules.helpers import print_lg
 from modules.linkedin_ui import apply_progress, find_apply_dialog, find_step_button
 
@@ -282,8 +283,11 @@ def fill_control(driver: WebDriver, field: dict, work_location: str,
         elif kind in ('text', 'textarea'):
             if field.get('value') and not field.get('required'): return None
             element = elements[0]
-            element.clear()
-            element.send_keys(str(answer))
+            if not needs_typeahead and (element.get_attribute('value') or '').strip() == str(answer).strip():
+                return question, str(answer)    # already right, e.g. revisiting a page from Review
+            if not replace_text(element, str(answer)):
+                print_lg(f'"{question}" still reads "{element.get_attribute("value")}" '
+                         f'instead of "{answer}".')
             if needs_typeahead:
                 # A location field only accepts a value chosen from its own suggestions; typed
                 # text leaves the form invalid and LinkedIn then refuses Next without saying why
@@ -291,6 +295,8 @@ def fill_control(driver: WebDriver, field: dict, work_location: str,
                 element.send_keys(Keys.ARROW_DOWN)
                 element.send_keys(Keys.ENTER)
                 time.sleep(1)
+            else:
+                answer = fit_to_validation(driver, element, str(answer), question)
 
         else:
             return None

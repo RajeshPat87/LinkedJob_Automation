@@ -15,6 +15,7 @@ version:    26.01.20.5.08
 '''
 
 from config.settings import click_gap, smooth_scroll
+from modules.form_values import replace_text
 from modules.helpers import buffer, print_lg, sleep
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
@@ -160,9 +161,7 @@ def company_search_click(driver: WebDriver, actions: ActionChains, companyName: 
 def text_input(actions: ActionChains, textInputEle: WebElement | bool, value: str, textFieldName: str = "Text") -> None | Exception:
     if textInputEle:
         sleep(1)
-        # actions.key_down(Keys.CONTROL).send_keys("a").key_up(Keys.CONTROL).perform()
-        textInputEle.clear()
-        textInputEle.send_keys(value.strip())
+        replace_text(textInputEle, value.strip())
         sleep(2)
         actions.send_keys(Keys.ENTER).perform()
     else:

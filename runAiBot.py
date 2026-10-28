@@ -53,6 +53,7 @@ from config.settings import *
 from modules.open_chrome import *
 from modules.helpers import *
 from modules.clickers_and_finders import *
+from modules.form_values import fit_to_validation, replace_text
 from modules.validator import validate_config
 from modules.throttle import ApplicationPacer, is_soft_block_text
 
@@ -757,6 +758,11 @@ def answer_common_questions(label: str, answer: str) -> str:
 
 
 
+# Salary questions asked in lakhs: "in lakhs", "in LPA", "in lacs". "LPA" fell through to the
+# full rupee amount and typed 3200000 where 32 was expected.
+LAKHS_UNIT = re.compile(r"lakh|\blacs?\b|\blpa\b")
+
+
 def resolve_text_answer(label: str, label_org: str, work_location: str,
                         job_description: str | None = None) -> tuple[str, bool]:
     '''
@@ -797,14 +803,14 @@ def resolve_text_answer(label: str, label_org: str, work_location: str,
         if 'current' in label or 'present' in label:
             if 'month' in label:
                 answer = current_ctc_monthly
-            elif 'lakh' in label:
+            elif LAKHS_UNIT.search(label):
                 answer = current_ctc_lakhs
             else:
                 answer = current_ctc
         else:
             if 'month' in label:
                 answer = desired_salary_monthly
-            elif 'lakh' in label:
+            elif LAKHS_UNIT.search(label):
                 answer = desired_salary_lakhs
             else:
                 answer = desired_salary
@@ -1032,12 +1038,13 @@ def answer_questions(modal: WebElement, questions_list: set, work_location: str,
             prev_answer = text.get_attribute("value")
             if not prev_answer or overwrite_previous_answers:
                 answer, do_actions = resolve_text_answer(label, label_org, work_location, job_description)
-                text.clear()
-                text.send_keys(answer)
+                replace_text(text, str(answer))
                 if do_actions:
                     sleep(2)
                     actions.send_keys(Keys.ARROW_DOWN)
                     actions.send_keys(Keys.ENTER).perform()
+                else:
+                    fit_to_validation(driver, text, str(answer), label_org)
             questions_list.add((label, text.get_attribute("value"), "text", prev_answer))
             continue
 
@@ -1076,12 +1083,11 @@ def answer_questions(modal: WebElement, questions_list: set, work_location: str,
                             answer = ""
                     else:
                         randomly_answered_questions.add((label_org, "textarea"))
-            text_area.clear()
-            text_area.send_keys(answer)
-            if do_actions:
-                    sleep(2)
-                    actions.send_keys(Keys.ARROW_DOWN)
-                    actions.send_keys(Keys.ENTER).perform()
+                # Only overwrite when there is something to write; an empty answer used to wipe
+                # the previous one
+                if answer:
+                    replace_text(text_area, answer)
+                    fit_to_validation(driver, text_area, answer, label_org)
             questions_list.add((label, text_area.get_attribute("value"), "textarea", prev_answer))
             ##<
             continue
