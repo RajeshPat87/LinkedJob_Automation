@@ -1339,14 +1339,21 @@ def easy_apply_new_ui(job_id: str, work_location: str, description: str | None) 
         pause_before_submit = False if decision == "Disable Pause" else True
         submit = apply_flow.submit_button(driver) or submit
 
-    try: submit.click()
-    except Exception: driver.execute_script("arguments[0].click();", submit)
-    time.sleep(3)
+    # Only a confirmation from LinkedIn counts as applied - a click alone has been logged as
+    # "Successfully saved" for applications that were never sent
+    if apply_flow.confirm_submitted(driver, submit):
+        apply_flow.close_confirmation(driver)
+        apply_flow.discard(driver)
+    else:
+        # No recognisable confirmation dialog. A sent application still swaps the job's
+        # Easy Apply button for "Applied", so check that once the flow is closed.
+        screenshot(driver, job_id, "Submit not confirmed")
+        apply_flow.discard(driver)
+        time.sleep(2)
+        if find_linkedin_apply_button(driver) is not None:
+            raise Exception('Clicked "Submit application" but LinkedIn never confirmed it was sent.')
+        print_lg("No confirmation dialog, but the job no longer offers Easy Apply, so it was sent.")
     date_applied = datetime.now()
-
-    # Close the confirmation the flow leaves behind, so it can't cover the next job's card
-    if not wait_span_click(driver, "Done", 2): actions.send_keys(Keys.ESCAPE).perform()
-    apply_flow.discard(driver)
     return True, resume, questions_list, date_applied
 
 

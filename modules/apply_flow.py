@@ -183,7 +183,7 @@ def _answer_for(question: str, kind: str, options: list[str], work_location: str
       own dropdown - typing into them leaves the form invalid and Next is silently refused
     '''
     from runAiBot import resolve_text_answer, answer_common_questions
-    from config.personals import gender, disability_status
+    from config.personals import gender, disability_status, country, state
 
     label_org = (question or "").strip().rstrip('*').strip()
     label = label_org.lower()
@@ -199,6 +199,10 @@ def _answer_for(question: str, kind: str, options: list[str], work_location: str
         if 'gender' in label or 'sex' in label: answer = gender
         elif 'disability' in label: answer = disability_status
         elif 'proficiency' in label: answer = 'Professional'
+        # A "Country" dropdown fell through to "Yes", matched nothing and got its first option
+        # ("United States of America"), which then failed the contact page's validation
+        elif 'country' in label and 'code' not in label: answer = country
+        elif label in ('state', 'state/province', 'province', 'region'): answer = state
         else: answer = answer_common_questions(label, 'Yes')
     else:
         answer, needs_typeahead = resolve_text_answer(label, label_org, work_location, job_description)
@@ -367,6 +371,77 @@ def submit_button(driver: WebDriver) -> WebElement | None:
         except Exception:
             continue
     return None
+
+
+# What LinkedIn shows once an application has really gone out ("Your application was sent to
+# Acme", "Application submitted"). Only ever matched against open dialogs: the results list beside
+# the job carries "Applied 2h ago" for other jobs and would confirm anything.
+SENT_TEXT = re.compile(r"application (was |has been )?sent|application submitted", re.I)
+
+
+def is_sent_confirmation(text: str) -> bool:
+    '''
+    Function to tell whether `text` is LinkedIn's "your application was sent" confirmation
+    '''
+    return bool(SENT_TEXT.search(text or ""))
+
+
+def _open_dialogs(driver: WebDriver) -> list[WebElement]:
+    dialogs = []
+    for dialog in driver.find_elements(By.XPATH, "//dialog | //*[@role='dialog' or @role='alertdialog']"):
+        try:
+            if dialog.is_displayed(): dialogs.append(dialog)
+        except Exception:
+            continue
+    return dialogs
+
+
+def confirm_submitted(driver: WebDriver, submit: WebElement, timeout: int = 20) -> bool:
+    '''
+    Function to click "Submit application" and wait for LinkedIn to confirm it was sent
+    * Returns True only once a confirmation dialog appears; False means nothing was sent
+    * The click used to be fire-and-forget, followed 3s later by Escape and `discard()`. When the
+      submit was still in flight - or the click never registered - that dismissed the flow and
+      left the job as an unsent draft ("In Progress" in the job tracker) while the run logged it
+      as applied. Nothing is closed here; the caller does that after a confirmed send.
+    * Clicks once more, by script, if the button is still sitting there halfway through the wait
+    '''
+    try: submit.click()
+    except Exception: driver.execute_script("arguments[0].click();", submit)
+    started = time.time()
+    clicked_again = False
+    while time.time() - started < timeout:
+        time.sleep(1)
+        for dialog in _open_dialogs(driver):
+            try:
+                if is_sent_confirmation(dialog.text): return True
+            except Exception:
+                continue
+        if not clicked_again and time.time() - started > timeout / 2:
+            pending = submit_button(driver)
+            if pending is not None:
+                print_lg('"Submit application" is still showing, clicking it again.')
+                driver.execute_script("arguments[0].click();", pending)
+                clicked_again = True
+    return False
+
+
+def close_confirmation(driver: WebDriver) -> None:
+    '''
+    Function to close the "application sent" confirmation so it can't cover the next job's card
+    * Its "Done" text isn't in a direct `<span>`, which is why `wait_span_click("Done")` failed on
+      every single application
+    '''
+    for dialog in _open_dialogs(driver):
+        button = find_step_button(dialog, "Done", "Close")
+        if button is None: continue
+        try:
+            driver.execute_script("arguments[0].click();", button)
+            time.sleep(1)
+            return
+        except Exception:
+            continue
+    driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
 
 
 def discard(driver: WebDriver) -> bool:
